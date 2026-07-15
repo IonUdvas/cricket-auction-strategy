@@ -1,0 +1,22 @@
+seed: 42
+
+device: cuda
+
+training:
+  epochs: 20
+  batch_size: 64
+  learning_rate: 0.001
+  weight_decay: 0.0
+
+model:
+  player_dim: 120
+  team_state_dim: 30
+  auction_state_dim: 25
+
+  num_archetypes: 8
+  num_teams: 10
+
+  embedding_dim: 16
+
+data:
+  train_size: 5000
