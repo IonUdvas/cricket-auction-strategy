@@ -23,11 +23,9 @@ class DummyAuctionDataset(Dataset):
 
         self.archetype = torch.randint(0, num_archetypes, (n_samples,))
 
-        # Dummy interval data
         self.lower_bid = torch.rand(n_samples) * 100
         self.upper_bid = self.lower_bid + 0.5
 
-        # Random winner indicator
         self.is_winner = torch.randint(0,2,(n_samples,)).bool()
 
     def __len__(self):

@@ -117,8 +117,6 @@ class ValuationModel(nn.Module):
         embedding_dim=16
     ):
         super().__init__()
-
-        # Intrinsic valuation network
         self.intrinsic = IntrinsicValuationNetwork(
             player_dim=player_dim,
             num_archetypes=num_archetypes,
@@ -126,7 +124,6 @@ class ValuationModel(nn.Module):
             embedding_dim=embedding_dim
         )
 
-        # Auction adjustment network
         self.auction = AuctionAdjustmentNetwork(
             team_state_dim=team_state_dim,
             auction_state_dim=auction_state_dim
@@ -141,25 +138,22 @@ class ValuationModel(nn.Module):
         auction_state
     ):
     
-        # Intrinsic valuation
         mu, sigma = self.intrinsic(
             player_features,
             archetype,
             team
         )
     
-        # Auction adjustment
         log_phi = self.auction(
             team_state,
             auction_state
         )
     
-        # Effective valuation
         mu_effective = mu + log_phi
     
         return {
             "mu": mu,
             "sigma": sigma,
             "log_phi": log_phi,
-            "mu_effective": mu + log_phi
+            "mu_effective": mu_effective
         }
