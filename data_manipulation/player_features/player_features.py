@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 class PlayerStatsAggregator:
     def __init__(self, ball_df):
@@ -273,7 +274,7 @@ class PlayerFeatureBuilder:
 
         rows = []
 
-        for player in players:
+        for player in tqdm(players):
 
             stats = self.stats_aggregator.get_player_stats(
                 player,
