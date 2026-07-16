@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
+from joblib import Parallel, delayed
+from tqdm.auto import tqdm
 
 class PlayerStatsAggregator:
     def __init__(self, ball_df):
