@@ -9,7 +9,7 @@ class AuctionReplayEngine:
         self,
         bid_df,
         player_df,
-        initial_purse=800,
+        initial_purse=8000,
         squad_size=25,
         overseas_limit=8
     ):
