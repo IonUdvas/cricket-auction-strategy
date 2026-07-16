@@ -60,7 +60,7 @@ class PlayerStatsAggregator:
 
         return {
 
-            "player": player,
+            "playerName": player,
 
             "end_date": end_date,
 
@@ -289,7 +289,7 @@ class PlayerFeatureBuilder:
         feature_df.fillna(0.0, inplace=True)
 
         feature_df.sort_values(
-            "player",
+            "playerName",
             inplace=True
         )
 
@@ -309,7 +309,7 @@ class PlayerFeatureBuilder:
             ##################################################
 
             "playerName":
-                stats["player"],
+                stats["playerName"],
 
             ##################################################
             # Experience
