@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-from utils import parse_price
+from data_manipulation.auction_state.utils import parse_price
 
 class AuctionReplayEngine:
 
