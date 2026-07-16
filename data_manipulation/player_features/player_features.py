@@ -251,6 +251,163 @@ class PlayerFeatureBuilder:
     def __init__(self, stats_aggregator):
         self.stats_aggregator = stats_aggregator
 
+    def build_feature_table(self, players, auction_date):
+        """
+        Build a feature table for all players available in an auction.
+
+        Parameters
+        ----------
+        players : list[str]
+            List of player names.
+
+        auction_date : str or datetime
+
+        Returns
+        -------
+        feature_df : pd.DataFrame
+            One row per player.
+
+        player_to_idx : dict
+            Mapping from player name to row index.
+        """
+
+        rows = []
+
+        for player in players:
+
+            stats = self.stats_aggregator.get_player_stats(
+                player,
+                auction_date
+            )
+
+            row = self._flatten_player_stats(stats)
+
+            rows.append(row)
+
+        feature_df = pd.DataFrame(rows)
+
+        feature_df.fillna(0.0, inplace=True)
+
+        feature_df.sort_values(
+            "player",
+            inplace=True
+        )
+
+        feature_df.reset_index(
+            drop=True,
+            inplace=True
+        )
+
+        player_to_idx = {
+            player: idx
+            for idx, player in enumerate(feature_df["player"])
+        }
+
+        return feature_df, player_to_idx
+
+    def _flatten_player_stats(self, stats):
+
+        return {
+
+            ##################################################
+            # Identity
+            ##################################################
+
+            "player":
+                stats["player"],
+
+            ##################################################
+            # Experience
+            ##################################################
+
+            "matches":
+                stats["experience"]["matches"],
+
+            "batting_matches":
+                stats["experience"]["batting_matches"],
+
+            "bowling_matches":
+                stats["experience"]["bowling_matches"],
+
+            "batting_innings":
+                stats["experience"]["batting_innings"],
+
+            "bowling_innings":
+                stats["experience"]["bowling_innings"],
+
+            ##################################################
+            # Batting Raw
+            ##################################################
+
+            "bat_runs":
+                stats["batting"]["raw"]["runs"],
+
+            "bat_balls":
+                stats["batting"]["raw"]["balls"],
+
+            "bat_outs":
+                stats["batting"]["raw"]["outs"],
+
+            "bat_fours":
+                stats["batting"]["raw"]["fours"],
+
+            "bat_sixes":
+                stats["batting"]["raw"]["sixes"],
+
+            "bat_dots":
+                stats["batting"]["raw"]["dots"],
+
+            ##################################################
+            # Batting Metrics
+            ##################################################
+
+            "bat_average":
+                stats["batting"]["metrics"]["average"],
+
+            "bat_strike_rate":
+                stats["batting"]["metrics"]["strike_rate"],
+
+            "boundary_percentage":
+                stats["batting"]["metrics"]["boundary_percentage"],
+
+            "dot_ball_percentage":
+                stats["batting"]["metrics"]["dot_ball_percentage"],
+
+            ##################################################
+            # Bowling Raw
+            ##################################################
+
+            "bowl_balls":
+                stats["bowling"]["raw"]["balls"],
+
+            "bowl_runs":
+                stats["bowling"]["raw"]["runs"],
+
+            "bowl_wickets":
+                stats["bowling"]["raw"]["wickets"],
+
+            "bowl_wides":
+                stats["bowling"]["raw"]["wides"],
+
+            "bowl_noballs":
+                stats["bowling"]["raw"]["noballs"],
+
+            ##################################################
+            # Bowling Metrics
+            ##################################################
+
+            "bowl_average":
+                stats["bowling"]["metrics"]["average"],
+
+            "economy":
+                stats["bowling"]["metrics"]["economy"],
+
+            "bowl_strike_rate":
+                stats["bowling"]["metrics"]["strike_rate"]
+        }
+    def __init__(self, stats_aggregator):
+        self.stats_aggregator = stats_aggregator
+
     def build_player_features(self, player, auction_date):
 
         stats = self.stats_aggregator.get_player_stats(
