@@ -308,7 +308,7 @@ class PlayerFeatureBuilder:
             # Identity
             ##################################################
 
-            "player":
+            "playerName":
                 stats["player"],
 
             ##################################################
