@@ -298,12 +298,7 @@ class PlayerFeatureBuilder:
             inplace=True
         )
 
-        player_to_idx = {
-            player: idx
-            for idx, player in enumerate(feature_df["player"])
-        }
-
-        return feature_df, player_to_idx
+        return feature_df
 
     def _flatten_player_stats(self, stats):
 
