@@ -114,7 +114,7 @@ def build_training_samples(
     engine = AuctionReplayEngine(
         bid_df,
         player_df,
-        initial_purse=800
+        initial_purse=8000
     )
 
     auction_state_df, team_state_df = engine.replay()
