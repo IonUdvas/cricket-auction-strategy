@@ -235,7 +235,7 @@ def build_bid_summary_for_all(player_bid_df, all_teams):
 
             "last_bid": np.nan,
 
-            "lower": 0,
+            "lower": 0.01,
             "upper": base_price,
 
             "winner": False
