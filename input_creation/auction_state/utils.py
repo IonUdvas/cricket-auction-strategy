@@ -197,7 +197,7 @@ def build_bid_summary_for_all(player_bid_df, all_teams):
         last_bid = bids.loc[idx, "BidAmount"]
 
         if idx == len(bids) - 1:
-            upper = np.inf
+            upper = 40
         else:
             upper = bids.loc[idx + 1, "BidAmount"]
 
