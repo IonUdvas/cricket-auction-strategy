@@ -2,7 +2,7 @@ import pandas as pd
 from input_creation.player_features.player_features import PlayerStatsAggregator, PlayerFeatureBuilder
 from input_creation.auction_state.auction_state import AuctionReplayEngine
 from input_creation.auction_state.utils import build_bid_summary
-from .auction_state.utils import build_bid_summary
+from .auction_state.utils import build_bid_summary_for_all as build_bid_summary
 
 class LabelEncoder:
 
@@ -161,7 +161,18 @@ def build_training_samples(
             continue
     
         summaries.append(
-            build_bid_summary(player_bid_df)
+            build_bid_summary(player_bid_df, all_teams = [
+    "CSK",
+    "DC",
+    "GT",
+    "KKR",
+    "LSG",
+    "MI",
+    "PBKS",
+    "RR",
+    "RCB",
+    "SRH",
+])
         )
     
     bid_summary = pd.concat(
