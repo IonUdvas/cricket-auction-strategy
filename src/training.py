@@ -135,4 +135,4 @@ def run_training_pipeline(
         epochs=config["training"]["epochs"],
     )
 
-    return model, history, encoder_manager, dataset, full_training_df
+    return model, history, encoder_manager, dataset, loader, full_training_df
