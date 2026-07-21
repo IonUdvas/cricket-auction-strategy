@@ -5,7 +5,9 @@ from tqdm.auto import tqdm
 
 class PlayerStatsAggregator:
     def __init__(self, ball_df):
+
         self.ball_df = ball_df.copy()
+
         self.ball_df["match_date"] = pd.to_datetime(
             self.ball_df["match_date"]
         )
@@ -20,17 +22,76 @@ class PlayerStatsAggregator:
             inplace=True
         )
 
+        ###############################################
+        # NEW
+        ###############################################
+
+        self.stats_cache = {}
+
+        self.empty_df = self.ball_df.iloc[:0].copy()
+
+        self.batting_groups = {
+            p: g.sort_values("match_date").reset_index(drop=True)
+            for p, g in self.ball_df.groupby("batsman")
+        }
+
+        self.bowling_groups = {
+            p: g.sort_values("match_date").reset_index(drop=True)
+            for p, g in self.ball_df.groupby("bowler")
+        }
+
     def get_player_stats(self, player, end_date):
+
         end_date = pd.to_datetime(end_date)
 
-        df = self.ball_df[
-            self.ball_df["match_date"] < end_date
-        ]
+        ##################################################
+        # Cache
+        ##################################################
 
-        bat_df = df[df["batsman"] == player]
+        key = (player, end_date)
 
-        bowl_df = df[df["bowler"] == player]
+        if key in self.stats_cache:
+            return self.stats_cache[key]
 
+        ##################################################
+        # Batting dataframe
+        ##################################################
+
+        bat_df = self.batting_groups.get(
+            player,
+            self.empty_df
+        )
+
+        if len(bat_df):
+
+            bat_idx = bat_df["match_date"].searchsorted(
+                end_date,
+                side="left"
+            )
+
+            bat_df = bat_df.iloc[:bat_idx]
+
+        ##################################################
+        # Bowling dataframe
+        ##################################################
+
+        bowl_df = self.bowling_groups.get(
+            player,
+            self.empty_df
+        )
+
+        if len(bowl_df):
+
+            bowl_idx = bowl_df["match_date"].searchsorted(
+                end_date,
+                side="left"
+            )
+
+            bowl_df = bowl_df.iloc[:bowl_idx]
+
+        ##################################################
+        # Compute statistics
+        ##################################################
 
         batting_raw = self._get_batting_raw_stats(
             bat_df,
@@ -46,11 +107,11 @@ class PlayerStatsAggregator:
             bowl_df
         )
 
+        # No fielding data available yet
         fielding = self._get_fielding_stats(
-            df,
+            None,
             player
         )
-
 
         batting = self._compute_batting_metrics(
             batting_raw
@@ -60,7 +121,7 @@ class PlayerStatsAggregator:
             bowling_raw
         )
 
-        return {
+        result = {
 
             "playerName": player,
 
@@ -81,64 +142,136 @@ class PlayerStatsAggregator:
             "fielding": fielding
         }
 
+        ##################################################
+        # Save in cache
+        ##################################################
+
+        self.stats_cache[key] = result
+
+        return result
 
     def _get_batting_raw_stats(self, bat_df, player):
+
+        if len(bat_df) == 0:
+
+            return {
+
+                "runs": 0,
+                "balls": 0,
+                "outs": 0,
+                "fours": 0,
+                "sixes": 0,
+                "dots": 0,
+                "boundaries": 0,
+                "matches": 0,
+                "innings": 0
+            }
+
+        ##################################################
+        # Convert once to NumPy
+        ##################################################
+
+        runs = bat_df["runs_off_bat"].to_numpy()
+        balls = bat_df["ball_faced"].to_numpy()
+        fours = bat_df["is_four"].to_numpy()
+        sixes = bat_df["is_six"].to_numpy()
+        dots = bat_df["is_dot"].to_numpy()
+        boundaries = bat_df["is_boundary"].to_numpy()
+        dismissed = bat_df["dismissed_player"].to_numpy()
+        matches = bat_df["match_uid"].to_numpy()
 
         return {
 
             "runs":
-                bat_df["runs_off_bat"].sum(),
+                runs.sum(),
 
             "balls":
-                bat_df["ball_faced"].sum(),
+                balls.sum(),
 
             "outs":
-                (bat_df["dismissed_player"] == player).sum(),
+                np.sum(dismissed == player),
 
             "fours":
-                bat_df["is_four"].sum(),
+                fours.sum(),
 
             "sixes":
-                bat_df["is_six"].sum(),
+                sixes.sum(),
 
             "dots":
-                bat_df["is_dot"].sum(),
+                dots.sum(),
 
             "boundaries":
-                bat_df["is_boundary"].sum(),
+                boundaries.sum(),
 
             "matches":
-                bat_df["match_uid"].nunique(),
+                np.unique(matches).size,
 
             "innings":
-                bat_df.groupby("match_uid").ngroups
+                np.unique(matches).size
         }
 
     def _get_bowling_raw_stats(self, bowl_df):
 
-        wickets = (
-            bowl_df["is_wicket"]
-            &
-            ~bowl_df["dismissal_type"].isin(
-                [
-                    "run out",
-                    "retired hurt",
-                    "retired out",
-                    "obstructing the field"
-                ]
-            )
-        ).sum()
+        if len(bowl_df) == 0:
+
+            return {
+
+                "balls": 0,
+                "deliveries": 0,
+                "runs": 0,
+                "wickets": 0,
+                "wides": 0,
+                "noballs": 0,
+                "matches": 0,
+                "innings": 0
+            }
+
+        ##################################################
+        # Convert once to NumPy
+        ##################################################
+
+        runs_off_bat = bowl_df["runs_off_bat"].to_numpy()
+        wides = bowl_df["wide"].to_numpy()
+        noballs = bowl_df["noball"].to_numpy()
+        legal = bowl_df["is_legal_ball"].to_numpy()
+
+        is_wicket = bowl_df["is_wicket"].to_numpy()
+        dismissal = bowl_df["dismissal_type"].to_numpy()
+
+        matches = bowl_df["match_uid"].to_numpy()
+
+        ##################################################
+        # Bowling wickets
+        ##################################################
+
+        invalid_dismissals = np.isin(
+            dismissal,
+            [
+                "run out",
+                "retired hurt",
+                "retired out",
+                "obstructing the field"
+            ]
+        )
+
+        wickets = np.sum(
+            is_wicket & (~invalid_dismissals)
+        )
+
+        ##################################################
+        # Runs conceded
+        ##################################################
 
         runs = (
-            bowl_df["runs_off_bat"].sum()
-            + bowl_df["wide"].sum()
-            + bowl_df["noball"].sum()
+            runs_off_bat.sum()
+            + wides.sum()
+            + noballs.sum()
         )
 
         return {
 
             "balls":
-                bowl_df["is_legal_ball"].sum(),
+                legal.sum(),
 
             "deliveries":
                 len(bowl_df),
@@ -150,16 +283,16 @@ class PlayerStatsAggregator:
                 wickets,
 
             "wides":
-                bowl_df["wide"].sum(),
+                wides.sum(),
 
             "noballs":
-                bowl_df["noball"].sum(),
+                noballs.sum(),
 
             "matches":
-                bowl_df["match_uid"].nunique(),
+                np.unique(matches).size,
 
             "innings":
-                bowl_df.groupby("match_uid").ngroups
+                np.unique(matches).size
         }
 
 
@@ -402,8 +535,6 @@ class PlayerFeatureBuilder:
             "bowl_strike_rate":
                 stats["bowling"]["metrics"]["strike_rate"]
         }
-    def __init__(self, stats_aggregator):
-        self.stats_aggregator = stats_aggregator
 
     def build_player_features(self, player, auction_date):
 
