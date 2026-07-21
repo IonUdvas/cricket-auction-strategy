@@ -5,7 +5,6 @@ from torch.utils.data import Dataset
 
 
 class IPLAuctionDataset(Dataset):
-
     def __init__(
         self,
         training_df,
@@ -13,7 +12,6 @@ class IPLAuctionDataset(Dataset):
     ):
 
         self.training_df = training_df.copy()
-
         self.encoder_manager = encoder_manager
 
         ########################################################
@@ -43,7 +41,6 @@ class IPLAuctionDataset(Dataset):
             ]
             .fillna(0)
             .to_numpy(dtype=np.float32),
-
             dtype=torch.float32
         )
 

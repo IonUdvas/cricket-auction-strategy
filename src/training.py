@@ -23,6 +23,18 @@ AUCTION_DATES = {
     2026: "2025-12-16",
 }
 
+AUCTION_MAX_PURSES = {
+    2018: 8000,
+    2019: 8200,
+    2020: 8500,
+    2021: 8500,
+    2022: 9000,
+    2023: 9500,
+    2024: 10000,
+    2025: 12000,
+    2026: 12500,
+}
+
 def build_training_df(
         player_template,
         bid_template,
@@ -42,7 +54,8 @@ def build_training_df(
             player_df_PATH,
             bid_df_PATH,
             bbb_parquet_PATH,
-            auction_date
+            auction_date,
+            auction_max_purse = AUCTION_MAX_PURSES[year]
         )
 
         training_dfs[year] = training_df

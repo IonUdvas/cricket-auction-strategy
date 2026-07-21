@@ -4,7 +4,11 @@ import pandas as pd
 from .utils import parse_price
 
 class AuctionReplayEngine:
-
+    TEAM_ALIASES = {
+        "DD": "DC",
+        "KXIP": "PBKS"
+    }
+    
     def __init__(
         self,
         bid_df,
@@ -13,9 +17,31 @@ class AuctionReplayEngine:
         squad_size=25,
         overseas_limit=8
     ):
-
+        
         self.bid_df = bid_df.copy()
         self.player_df = player_df.copy()
+
+        self._normalize_inputs()
+
+        self.initial_purse = initial_purse
+        self.squad_size = squad_size
+        self.overseas_limit = overseas_limit
+
+        self.teams = sorted(pd.concat([
+                self.bid_df["Team"],
+                self.player_df["playsForTeam"]
+            ]).dropna().unique())
+        
+    def _normalize_inputs(self):
+        self.bid_df["Team"] = (
+            self.bid_df["Team"]
+            .replace(self.TEAM_ALIASES)
+        )
+
+        self.player_df["playsForTeam"] = (
+            self.player_df["playsForTeam"]
+            .replace(self.TEAM_ALIASES)
+        )
 
         self.bid_df["BidAmount"] = (
             self.bid_df["BidAmount"]
@@ -27,19 +53,22 @@ class AuctionReplayEngine:
             .apply(parse_price)
         )
 
-        self.initial_purse = initial_purse
-        self.squad_size = squad_size
-        self.overseas_limit = overseas_limit
-
-        self.teams = sorted(
-            self.bid_df["Team"].dropna().unique()
-        )
-
     ###############################################################
+    def _apply_preauction_events(self, team_state):
+        retained = self.player_df[
+            self.player_df["auctionStatus"]
+            .str.lower()
+            .eq("retained")
+        ]
+
+        for _, player in retained.iterrows():
+            self._handle_retention(player, team_state)
+
 
     def replay(self):
 
         team_state = self._initialize_team_state()
+        self._apply_preauction_events(team_state)
 
         auction_rows = []
 
@@ -165,7 +194,7 @@ class AuctionReplayEngine:
                 remaining["isPlayerOverseas"].sum()
         }
 
-    ###############################################################
+    ##############################################################
 
     def _replay_player(
         self,
@@ -189,3 +218,21 @@ class AuctionReplayEngine:
         if player["isPlayerOverseas"]:
 
             team_state[winner]["overseas_bought"] += 1
+
+# def _replay_player(self, player, team_state):
+#     status = player["auctionStatus"].lower()
+
+#     if status == "sold":
+#         self._handle_sold(player, team_state)
+
+#     elif status == "retained":
+#         self._handle_retention(player, team_state)
+
+#     elif status == "rtm":
+#         self._handle_rtm(player, team_state)
+
+#     elif status == "unsold":
+#         self._handle_unsold(player)
+
+#     else:
+#         self._handle_other(player)
