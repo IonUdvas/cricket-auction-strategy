@@ -382,7 +382,6 @@ class PlayerStatsAggregator:
         }
 
 class PlayerFeatureBuilder:
-
     def __init__(self, stats_aggregator):
         self.stats_aggregator = stats_aggregator
 
@@ -398,7 +397,7 @@ class PlayerFeatureBuilder:
         auction_date : str or datetime
 
         Returns
-        -------
+        ----------
         feature_df : pd.DataFrame
             One row per player.
 
@@ -546,58 +545,42 @@ class PlayerFeatureBuilder:
         return {
 
             # Experience
-
             "matches":
                 stats["experience"]["matches"],
-
             "batting_matches":
                 stats["experience"]["batting_matches"],
-
             "bowling_matches":
                 stats["experience"]["bowling_matches"],
 
             # Batting metrics
-
             "bat_average":
                 stats["batting"]["metrics"]["average"],
-
             "bat_strike_rate":
                 stats["batting"]["metrics"]["strike_rate"],
-
             "boundary_percentage":
                 stats["batting"]["metrics"]["boundary_percentage"],
-
             "dot_ball_percentage":
                 stats["batting"]["metrics"]["dot_ball_percentage"],
 
             # Bowling metrics
-
             "bowl_average":
                 stats["bowling"]["metrics"]["average"],
-
             "economy":
                 stats["bowling"]["metrics"]["economy"],
-
             "bowl_strike_rate":
                 stats["bowling"]["metrics"]["strike_rate"],
 
             # Keep the raw stats as well
-
             "bat_runs":
                 stats["batting"]["raw"]["runs"],
-
             "bat_balls":
                 stats["batting"]["raw"]["balls"],
-
             "bat_outs":
                 stats["batting"]["raw"]["outs"],
-
             "bowl_balls":
                 stats["bowling"]["raw"]["balls"],
-
             "bowl_runs":
                 stats["bowling"]["raw"]["runs"],
-
             "bowl_wickets":
                 stats["bowling"]["raw"]["wickets"]
         }

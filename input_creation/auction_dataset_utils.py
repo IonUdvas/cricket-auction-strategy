@@ -98,12 +98,12 @@ class EncoderManager:
         return self.encoders[column]
     
 
-
 def build_training_samples(
     player_df_PATH,
     bid_df_PATH,
     bbb_data_parquet_PATH,
-    auction_date
+    auction_date,
+    auction_max_purse
 ):
     bbb_data_df = pd.read_parquet(bbb_data_parquet_PATH).sort_values("match_date").reset_index(drop=True)
     player_feature_builder = PlayerFeatureBuilder(PlayerStatsAggregator(bbb_data_df))
@@ -114,7 +114,16 @@ def build_training_samples(
     engine = AuctionReplayEngine(
         bid_df,
         player_df,
-        initial_purse=8000
+        initial_purse=auction_max_purse
+    )
+
+    teams = sorted(
+        pd.concat([
+            bid_df["Team"],
+            player_df["playsForTeam"]
+        ])
+        .dropna()
+        .unique()
     )
 
     auction_state_df, team_state_df = engine.replay()
@@ -161,18 +170,7 @@ def build_training_samples(
             continue
     
         summaries.append(
-            build_bid_summary(player_bid_df, all_teams = [
-    "CSK",
-    "DC",
-    "GT",
-    "KKR",
-    "LSG",
-    "MI",
-    "PBKS",
-    "RR",
-    "RCB",
-    "SRH",
-])
+            build_bid_summary(player_bid_df, all_teams = teams)
         )
     
     bid_summary = pd.concat(
