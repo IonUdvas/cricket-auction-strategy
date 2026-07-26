@@ -200,6 +200,15 @@ class AuctionReplayEngine:
             .reset_index(drop=True)
         )
 
+        valid_player_ids = set(self.player_df["playerId"])
+
+        self.bid_df = (
+            self.bid_df[
+                self.bid_df["playerId"].isin(valid_player_ids)
+            ]
+            .reset_index(drop=True)
+        )
+
         # ---------------------------------------------------------
         # Participating teams
         # ---------------------------------------------------------
