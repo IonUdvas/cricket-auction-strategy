@@ -295,14 +295,4 @@ def build_training_samples(
 
     ]
 
-    ############################################################
-    # Save replay outputs for debugging
-    ############################################################
-
-    training_df.attrs["auction_state_df"] = auction_state_df
-
-    training_df.attrs["team_state_df"] = team_state_df
-
-    training_df.attrs["bid_summary_df"] = bid_summary_df
-
     return training_df
