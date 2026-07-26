@@ -783,40 +783,36 @@ class AuctionReplayEngine:
         player_bid_df,
     ):
         """
-        Construct valuation observations for a player sold via the
-        Right-To-Match (RTM) rule.
+        Placeholder implementation for RTM players.
 
-        Parameters
-        ----------
-        player : pd.Series
-            Player row from self.player_df.
-
-        player_bid_df : pd.DataFrame
-            Bid history for this player.
-
-        Returns
-        -------
-        dict
-            Dictionary keyed by team, containing
-
-            {
-                "lower",
-                "upper",
-                "winner",
-                "observation_type",
-                ...
-            }
-
-        Notes
-        -----
-        RTM observations require special treatment because the auction
-        winner and the final owner differ. The exact censoring strategy
-        has not yet been finalized.
-
-        This method is intentionally left as a placeholder.
+        TODO
+        ----
+        Replace with the proper RTM valuation model.
         """
 
-        pass
+        summary = self._empty_team_summary()
+
+        base_price = player["basePrice"]
+
+        for team in self.teams:
+
+            summary[team].update({
+
+                "previous_bid": np.nan,
+
+                "last_bid": np.nan,
+
+                "lower": 0.01,
+
+                "upper": base_price,
+
+                "winner": False,
+
+                "observation_type": "unknown",
+
+            })
+
+        return summary
 
     def _player_metadata(
         self,
