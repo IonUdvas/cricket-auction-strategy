@@ -30,6 +30,8 @@ class AuctionReplayEngine:
 
     STATUS_RTM = "RTM"
 
+    STATUS_TRADED = "TRADED"
+
     ####################################################################
     # Team aliases
     ####################################################################
@@ -177,6 +179,10 @@ class AuctionReplayEngine:
             .sort_values("id")
             .reset_index(drop=True)
         )
+
+        self.player_df = self.player_df[
+            self.player_df["auctionStatus"] != self.STATUS_TRADED
+        ].reset_index(drop=True)
 
         self.bid_df = (
             self.bid_df
