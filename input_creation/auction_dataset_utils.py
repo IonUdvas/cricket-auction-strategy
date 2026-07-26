@@ -228,16 +228,3 @@ def build_training_samples(
 
     return training_df
 
-def build_encoders(training_df):
-
-    manager = EncoderManager()
-
-    manager.fit(
-        training_df,
-        [
-            "team",
-            "role"
-        ]
-    )
-
-    return manager
