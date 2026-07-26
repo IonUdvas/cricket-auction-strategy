@@ -1007,6 +1007,28 @@ class AuctionReplayEngine:
             player["role"],
         )
 
+    def _apply_retention(
+        self,
+        player,
+    ):
+        """
+        Retentions are applied before the auction begins.
+
+        Therefore this method intentionally does nothing.
+        """
+
+        return
+    
+    def _apply_unsold(
+        self,
+        player,
+    ):
+        """
+        Unsold players do not modify team state.
+        """
+
+        return
+
     def _apply_rtm(
         self,
         player,
