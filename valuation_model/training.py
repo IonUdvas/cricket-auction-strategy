@@ -48,7 +48,7 @@ def train_one_epoch(
             sigma=output["sigma"],
             lower_bid=batch["lower_bid"],
             upper_bid=batch["upper_bid"],
-            winner=batch["winner"],
+            observation_type=batch["observation_type"],
         )
 
         loss = stats["loss"]
