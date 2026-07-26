@@ -180,9 +180,19 @@ class AuctionReplayEngine:
             .reset_index(drop=True)
         )
 
-        self.player_df = self.player_df[
-            self.player_df["auctionStatus"] != self.STATUS_TRADED
-        ].reset_index(drop=True)
+        VALID_STATUSES = {
+            self.STATUS_SOLD,
+            self.STATUS_UNSOLD,
+            self.STATUS_RETAINED,
+            self.STATUS_RTM,
+        }
+
+        self.player_df = (
+            self.player_df[
+                self.player_df["auctionStatus"].isin(VALID_STATUSES)
+            ]
+            .reset_index(drop=True)
+        )
 
         self.bid_df = (
             self.bid_df
