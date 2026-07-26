@@ -2,13 +2,7 @@ import numpy as np
 import pandas as pd
 import re
 
-STATUS_SOLD = "SOLD"
 
-STATUS_UNSOLD = "UNSOLD"
-
-STATUS_RETAINED = "RETAINED"
-
-STATUS_RTM = "RTM"
 
 class AuctionReplayEngine:
     """
@@ -27,6 +21,14 @@ class AuctionReplayEngine:
 
     observed immediately BEFORE the player's auction outcome is applied.
     """
+
+    STATUS_SOLD = "SOLD"
+
+    STATUS_UNSOLD = "UNSOLD"
+
+    STATUS_RETAINED = "RETAINED"
+
+    STATUS_RTM = "RTM"
 
     ####################################################################
     # Team aliases
