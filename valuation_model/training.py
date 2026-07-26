@@ -36,7 +36,7 @@ def train_one_epoch(
         # Forward pass
         output = model(
             batch["player_features"],
-            batch["archetype"],
+            batch["role"],
             batch["team"],
             batch["team_state"],
             batch["auction_state"],
