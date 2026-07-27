@@ -36,13 +36,6 @@ def train_one_epoch(
         # Forward pass
         ########################################################
 
-        print(batch["player_features"].min(), batch["player_features"].max())
-        print(batch["team_state"].min(), batch["team_state"].max())
-        print(batch["auction_state"].min(), batch["auction_state"].max())
-
-        print(torch.isnan(batch["player_features"]).any())
-        print(torch.isnan(batch["team_state"]).any())
-        print(torch.isnan(batch["auction_state"]).any())
 
         output = model(
             batch["player_features"],
@@ -52,12 +45,6 @@ def train_one_epoch(
             batch["auction_state"],
         )
 
-        print(torch.isfinite(output["mu"]).all())
-        print(torch.isfinite(output["log_phi"]).all())
-        print(torch.isfinite(output["mu_effective"]).all())
-        print(torch.isfinite(output["sigma"]).all())
-
-        break
 
         ########################################################
         # Loss
