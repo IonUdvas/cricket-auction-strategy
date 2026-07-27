@@ -97,22 +97,21 @@ def run_training_pipeline(
     full_training_df = build_training_df(player_template, bid_template, parquet_path)
     encoder_manager, dataset, loader = load_and_encode_data(full_training_df)
 
-    training_df = full_training_df
-    print(training_df.shape)
+    print(dataset.player_features.shape)
+    print(dataset.team_state.shape)
+    print(dataset.auction_state.shape)
 
-    # Count NaNs in every column
-    print(training_df.isna().sum().sort_values(ascending=False).head(50))
+    print(len(full_training_df.attrs["player_feature_columns"]))
+    print(len(full_training_df.attrs["team_state_columns"]))
+    print(len(full_training_df.attrs["auction_state_columns"]))
 
-    # Check for infinities in numeric columns
-    import numpy as np
+    print(torch.isnan(dataset.player_features).any())
+    print(torch.isnan(dataset.team_state).any())
+    print(torch.isnan(dataset.auction_state).any())
 
-    numeric = training_df.select_dtypes(include=[np.number])
-
-    print("Columns with +inf:")
-    print((numeric == np.inf).sum()[(numeric == np.inf).sum() > 0])
-
-    print("Columns with -inf:")
-    print((numeric == -np.inf).sum()[(numeric == -np.inf).sum() > 0])
+    print(torch.isfinite(dataset.player_features).all())
+    print(torch.isfinite(dataset.team_state).all())
+    print(torch.isfinite(dataset.auction_state).all())
 
     config["model"]["player_dim"] = len(
         full_training_df.attrs["player_feature_columns"]
