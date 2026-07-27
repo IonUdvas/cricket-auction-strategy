@@ -174,7 +174,23 @@ class IntervalCensoredLoss(nn.Module):
                 ),
 
             ####################################################
-            # Mean probabilities
+            # Backward compatibility
+            ####################################################
+
+            "winner_probability":
+                masked_mean(
+                    right_prob,
+                    right_mask
+                ),
+
+            "loser_probability":
+                masked_mean(
+                    interval_prob,
+                    interval_mask
+                ),
+
+            ####################################################
+            # New metrics
             ####################################################
 
             "interval_probability":
@@ -222,15 +238,14 @@ class IntervalCensoredLoss(nn.Module):
             ####################################################
 
             "num_interval":
-                interval_mask.sum(),
+                interval_mask.sum().float(),
 
             "num_left":
-                left_mask.sum(),
+                left_mask.sum().float(),
 
             "num_right":
-                right_mask.sum(),
+                right_mask.sum().float(),
 
             "num_unknown":
-                unknown_mask.sum(),
-
+                unknown_mask.sum().float(),
         }

@@ -1,5 +1,6 @@
 import torch
 
+
 def train_one_epoch(
     model,
     loader,
@@ -18,22 +19,23 @@ def train_one_epoch(
 
     model.train()
 
-    running = {
-        "loss": 0.0,
-        "likelihood": 0.0,
-        "winner_probability": 0.0,
-        "loser_probability": 0.0,
-    }
+    running = None
 
     for batch in loader:
 
+        ########################################################
         # Move tensors to device
+        ########################################################
+
         batch = {
             key: value.to(device) if torch.is_tensor(value) else value
             for key, value in batch.items()
         }
 
+        ########################################################
         # Forward pass
+        ########################################################
+
         output = model(
             batch["player_features"],
             batch["role"],
@@ -42,7 +44,10 @@ def train_one_epoch(
             batch["auction_state"],
         )
 
-        # Compute loss
+        ########################################################
+        # Loss
+        ########################################################
+
         stats = criterion(
             mu=output["mu_effective"],
             sigma=output["sigma"],
@@ -53,18 +58,42 @@ def train_one_epoch(
 
         loss = stats["loss"]
 
+        ########################################################
         # Backpropagation
+        ########################################################
+
         optimizer.zero_grad()
 
         loss.backward()
 
         optimizer.step()
 
-        # Accumulate metrics
-        for key in running:
-            running[key] += stats[key].item()
+        ########################################################
+        # Initialize metrics
+        ########################################################
 
-    # Average over batches
+        if running is None:
+
+            running = {
+                key: 0.0
+                for key in stats
+            }
+
+        ########################################################
+        # Accumulate metrics
+        ########################################################
+
+        for key, value in stats.items():
+
+            if torch.is_tensor(value):
+                running[key] += value.item()
+            else:
+                running[key] += float(value)
+
+    ############################################################
+    # Average
+    ############################################################
+
     for key in running:
         running[key] /= len(loader)
 
@@ -89,38 +118,68 @@ def validate_one_epoch(
 
     model.eval()
 
-    running = {
-        "loss": 0.0,
-        "likelihood": 0.0,
-        "winner_probability": 0.0,
-        "loser_probability": 0.0,
-    }
+    running = None
 
     for batch in loader:
+
+        ########################################################
+        # Move tensors to device
+        ########################################################
 
         batch = {
             key: value.to(device) if torch.is_tensor(value) else value
             for key, value in batch.items()
         }
 
+        ########################################################
+        # Forward
+        ########################################################
+
         output = model(
             batch["player_features"],
-            batch["archetype"],
+            batch["role"],
             batch["team"],
             batch["team_state"],
             batch["auction_state"],
         )
+
+        ########################################################
+        # Loss
+        ########################################################
 
         stats = criterion(
             mu=output["mu_effective"],
             sigma=output["sigma"],
             lower_bid=batch["lower_bid"],
             upper_bid=batch["upper_bid"],
-            winner=batch["winner"],
+            observation_type=batch["observation_type"],
         )
 
-        for key in running:
-            running[key] += stats[key].item()
+        ########################################################
+        # Initialize metrics
+        ########################################################
+
+        if running is None:
+
+            running = {
+                key: 0.0
+                for key in stats
+            }
+
+        ########################################################
+        # Accumulate metrics
+        ########################################################
+
+        for key, value in stats.items():
+
+            if torch.is_tensor(value):
+                running[key] += value.item()
+            else:
+                running[key] += float(value)
+
+    ############################################################
+    # Average
+    ############################################################
 
     for key in running:
         running[key] /= len(loader)
@@ -153,6 +212,10 @@ def train(
 
     for epoch in range(epochs):
 
+        ########################################################
+        # Training
+        ########################################################
+
         train_stats = train_one_epoch(
             model=model,
             loader=train_loader,
@@ -162,6 +225,10 @@ def train(
         )
 
         history["train"].append(train_stats)
+
+        ########################################################
+        # Validation
+        ########################################################
 
         if valid_loader is not None:
 
