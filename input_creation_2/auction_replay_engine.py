@@ -678,9 +678,9 @@ class AuctionReplayEngine:
 
                 "last_bid": info["last_bid"],
 
-                "lower": info["previous_bid"],
+                "lower": info["last_bid"],
 
-                "upper": info["last_bid"],
+                "upper": info["next_bid"],
 
                 "winner": False,
 
