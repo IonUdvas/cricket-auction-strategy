@@ -137,6 +137,13 @@ class ValuationModel(nn.Module):
         team_state,
         auction_state
     ):
+
+        assert torch.isfinite(player_features).all(), "player_features contains NaN/Inf"
+        assert torch.isfinite(team_state).all(), "team_state contains NaN/Inf"
+        assert torch.isfinite(auction_state).all(), "auction_state contains NaN/Inf"
+
+        assert torch.isfinite(archetype.float()).all()
+        assert torch.isfinite(team.float()).all()
     
         mu, sigma = self.intrinsic(
             player_features,
