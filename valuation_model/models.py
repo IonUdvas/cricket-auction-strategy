@@ -163,6 +163,20 @@ class ValuationModel(nn.Module):
         )
     
         mu_effective = mu + log_phi
+
+        if not torch.isfinite(mu).all():
+            raise RuntimeError("mu is NaN")
+
+        if not torch.isfinite(log_phi).all():
+            raise RuntimeError("log_phi is NaN")
+
+        if not torch.isfinite(sigma).all():
+            raise RuntimeError("sigma is NaN")
+
+        mu_effective = mu + log_phi
+
+        if not torch.isfinite(mu_effective).all():
+            raise RuntimeError("mu_effective is NaN")
     
         return {
             "mu": mu,
