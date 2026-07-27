@@ -70,6 +70,11 @@ def train_one_epoch(
 
         optimizer.step()
 
+        for name, p in model.named_parameters():
+            if not torch.isfinite(p).all():
+                print(name, "became NaN after optimizer step")
+                raise RuntimeError
+
         ########################################################
         # Initialize metrics
         ########################################################

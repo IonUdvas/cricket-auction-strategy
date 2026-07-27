@@ -46,12 +46,6 @@ class IntrinsicValuationNetwork(nn.Module):
         team
     ):
 
-        print(archetype.min(), archetype.max())
-        print(team.min(), team.max())
-
-        print(self.archetype_embedding.num_embeddings)
-        print(self.team_embedding.num_embeddings)
-
         a = self.archetype_embedding(archetype)
         t = self.team_embedding(team)
 
