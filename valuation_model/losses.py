@@ -167,7 +167,7 @@ class IntervalCensoredLoss(nn.Module):
             # Overall likelihood
             ####################################################
 
-            "mean_likelihood":
+            "likelihood":
                 masked_mean(
                     likelihood,
                     valid_mask
