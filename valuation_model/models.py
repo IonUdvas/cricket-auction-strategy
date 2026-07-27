@@ -60,7 +60,19 @@ class IntrinsicValuationNetwork(nn.Module):
             dim=1
         )
 
-        h = self.network(x)
+        # h = self.network(x)
+
+        h = x
+
+        for i, layer in enumerate(self.network):
+
+            h = layer(h)
+
+            print(i, layer, torch.isfinite(h).all())
+
+            if not torch.isfinite(h).all():
+                print(h)
+                raise RuntimeError
 
         mu = self.mu_head(h)
 
