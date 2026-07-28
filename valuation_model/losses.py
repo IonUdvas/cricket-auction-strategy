@@ -35,11 +35,11 @@ class IntervalCensoredLoss(nn.Module):
         # Distribution
         ########################################################
 
-        print("Printing mus")
-        print(mu.min(), mu.max())
-        print(sigma.min(), sigma.max())
-        print(lower_bid.min(), lower_bid.max())
-        print(upper_bid.min(), upper_bid.max())
+        # print("Printing mus")
+        # print(mu.min(), mu.max())
+        # print(sigma.min(), sigma.max())
+        # print(lower_bid.min(), lower_bid.max())
+        # print(upper_bid.min(), upper_bid.max())
 
         dist = LogNormal(mu, sigma)
 
