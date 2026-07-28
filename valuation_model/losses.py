@@ -35,11 +35,29 @@ class IntervalCensoredLoss(nn.Module):
     ):
 
         ########################################################
-        # Remove trailing dimensions
+        # Shapes
         ########################################################
 
         mu = mu.squeeze(-1)
         sigma = sigma.squeeze(-1)
+
+        ########################################################
+        # Numerical safety
+        ########################################################
+
+        sigma = torch.clamp(sigma, min=0.05, max=3.0)
+
+        lower_bid = torch.clamp(lower_bid, min=1e-3)
+        upper_bid = torch.clamp(upper_bid, min=1e-3)
+
+        ########################################################
+        # Ensure valid intervals
+        ########################################################
+
+        upper_bid = torch.maximum(
+            upper_bid,
+            lower_bid + 1e-3
+        )
 
         ########################################################
         # Distribution
@@ -63,6 +81,7 @@ class IntervalCensoredLoss(nn.Module):
         interval_prob = torch.clamp(
             interval_prob,
             min=self.eps,
+            max=1.0
         )
 
         ########################################################
@@ -70,6 +89,9 @@ class IntervalCensoredLoss(nn.Module):
         ########################################################
 
         nll = -torch.log(interval_prob)
+
+        # Prevent rare pathological samples from exploding
+        nll = torch.clamp(nll, max=50.0)
 
         loss = nll.mean()
 
