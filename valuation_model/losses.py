@@ -5,11 +5,21 @@ from torch.distributions import LogNormal
 
 
 class IntervalCensoredLoss(nn.Module):
+    """
+    Unified interval likelihood loss.
 
-    OBS_LEFT = 0
-    OBS_INTERVAL = 1
-    OBS_RIGHT = 2
-    OBS_UNKNOWN = 3
+    Every observation is treated as a finite interval:
+
+        left:      (0.01, basePrice)
+        interval:  (lastBid, nextBid)
+        right:     (winningBid, 2 * winningBid)
+
+    The likelihood for every sample is:
+
+        P(lower <= V < upper) = F(upper) - F(lower)
+
+    where V follows a LogNormal(mu, sigma).
+    """
 
     def __init__(self, eps=1e-10):
         super().__init__()
@@ -21,7 +31,7 @@ class IntervalCensoredLoss(nn.Module):
         sigma,
         lower_bid,
         upper_bid,
-        observation_type,
+        observation_type=None,  # kept for backward compatibility
     ):
 
         ########################################################
@@ -35,33 +45,16 @@ class IntervalCensoredLoss(nn.Module):
         # Distribution
         ########################################################
 
-        # print("Printing mus")
-        # print(mu.min(), mu.max())
-        # print(sigma.min(), sigma.max())
-        # print(lower_bid.min(), lower_bid.max())
-        # print(upper_bid.min(), upper_bid.max())
-
         dist = LogNormal(mu, sigma)
 
         ########################################################
-        # Observation likelihoods
+        # Unified interval likelihood
         ########################################################
 
-        interval_prob = (
-            dist.cdf(upper_bid)
-            -
-            dist.cdf(lower_bid)
-        )
+        upper_cdf = dist.cdf(upper_bid)
+        lower_cdf = dist.cdf(lower_bid)
 
-        left_prob = (
-            dist.cdf(upper_bid)
-        )
-
-        right_prob = (
-            1.0
-            -
-            dist.cdf(lower_bid)
-        )
+        interval_prob = upper_cdf - lower_cdf
 
         ########################################################
         # Numerical stability
@@ -69,92 +62,16 @@ class IntervalCensoredLoss(nn.Module):
 
         interval_prob = torch.clamp(
             interval_prob,
-            min=self.eps
-        )
-
-        left_prob = torch.clamp(
-            left_prob,
-            min=self.eps
-        )
-
-        right_prob = torch.clamp(
-            right_prob,
-            min=self.eps
+            min=self.eps,
         )
 
         ########################################################
-        # Masks
+        # Negative log-likelihood
         ########################################################
 
-        interval_mask = (
-            observation_type == self.OBS_INTERVAL
-        )
+        nll = -torch.log(interval_prob)
 
-        left_mask = (
-            observation_type == self.OBS_LEFT
-        )
-
-        right_mask = (
-            observation_type == self.OBS_RIGHT
-        )
-
-        unknown_mask = (
-            observation_type == self.OBS_UNKNOWN
-        )
-
-        valid_mask = ~unknown_mask
-
-        ########################################################
-        # Per-sample likelihood
-        ########################################################
-
-        likelihood = torch.ones_like(mu)
-
-        likelihood[interval_mask] = (
-            interval_prob[interval_mask]
-        )
-
-        likelihood[left_mask] = (
-            left_prob[left_mask]
-        )
-
-        likelihood[right_mask] = (
-            right_prob[right_mask]
-        )
-
-        ########################################################
-        # Overall Loss
-        ########################################################
-
-        loss = -torch.log(
-            likelihood[valid_mask]
-        ).mean()
-
-        ########################################################
-        # Debug metrics
-        ########################################################
-
-        def masked_mean(x, mask):
-
-            if mask.any():
-                return x[mask].mean()
-
-            return torch.tensor(
-                float("nan"),
-                device=x.device,
-            )
-
-        def masked_nll(x, mask):
-
-            if mask.any():
-                return -torch.log(
-                    x[mask]
-                ).mean()
-
-            return torch.tensor(
-                float("nan"),
-                device=x.device,
-            )
+        loss = nll.mean()
 
         ########################################################
         # Return
@@ -166,92 +83,34 @@ class IntervalCensoredLoss(nn.Module):
             # Optimization target
             ####################################################
 
-            "loss":
-                loss,
+            "loss": loss,
 
             ####################################################
             # Overall likelihood
             ####################################################
 
-            "likelihood":
-                masked_mean(
-                    likelihood,
-                    valid_mask
-                ),
+            "likelihood": interval_prob.mean(),
 
             ####################################################
-            # Backward compatibility
+            # Mean negative log-likelihood
             ####################################################
 
-            "winner_probability":
-                masked_mean(
-                    right_prob,
-                    right_mask
-                ),
-
-            "loser_probability":
-                masked_mean(
-                    interval_prob,
-                    interval_mask
-                ),
+            "nll": nll.mean(),
 
             ####################################################
-            # New metrics
+            # Diagnostics
             ####################################################
 
-            "interval_probability":
-                masked_mean(
-                    interval_prob,
-                    interval_mask
-                ),
+            "interval_probability": interval_prob.mean(),
 
-            "left_probability":
-                masked_mean(
-                    left_prob,
-                    left_mask
-                ),
-
-            "right_probability":
-                masked_mean(
-                    right_prob,
-                    right_mask
-                ),
+            "interval_loss": nll.mean(),
 
             ####################################################
-            # Individual losses
+            # Batch size
             ####################################################
 
-            "interval_loss":
-                masked_nll(
-                    interval_prob,
-                    interval_mask
-                ),
-
-            "left_loss":
-                masked_nll(
-                    left_prob,
-                    left_mask
-                ),
-
-            "right_loss":
-                masked_nll(
-                    right_prob,
-                    right_mask
-                ),
-
-            ####################################################
-            # Batch composition
-            ####################################################
-
-            "num_interval":
-                interval_mask.sum().float(),
-
-            "num_left":
-                left_mask.sum().float(),
-
-            "num_right":
-                right_mask.sum().float(),
-
-            "num_unknown":
-                unknown_mask.sum().float(),
+            "num_samples": torch.tensor(
+                float(interval_prob.numel()),
+                device=interval_prob.device,
+            ),
         }
