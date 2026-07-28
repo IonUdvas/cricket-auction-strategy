@@ -7,29 +7,21 @@ import re
 class AuctionReplayEngine:
     """
     Replays an IPL auction exactly once.
-
     During replay, the engine simultaneously constructs
 
         • auction_state_df
         • team_state_df
         • bid_summary_df
         • training_df
-
     Every row corresponds to one
-
         Player × Team
-
     observed immediately BEFORE the player's auction outcome is applied.
     """
 
     STATUS_SOLD = "SOLD"
-
     STATUS_UNSOLD = "UNSOLD"
-
     STATUS_RETAINED = "RETAINED"
-
     STATUS_RTM = "RTM"
-
     STATUS_TRADED = "TRADED"
 
     ####################################################################
@@ -37,10 +29,8 @@ class AuctionReplayEngine:
     ####################################################################
 
     TEAM_ALIASES = {
-
         "DD": "DC",
         "KXIP": "PBKS",
-
     }
 
     ####################################################################
@@ -68,7 +58,6 @@ class AuctionReplayEngine:
         ############################################################
 
         self.teams = None
-
         self.team_state = None
 
         ############################################################
@@ -87,6 +76,7 @@ class AuctionReplayEngine:
         ############################################################
 
         self._normalize_inputs()
+
 
     def _normalize_inputs(self):
         """
@@ -133,7 +123,6 @@ class AuctionReplayEngine:
         ]
 
         for col in money_cols:
-
             self.player_df[col] = (
                 self.player_df[col]
                 .apply(self._parse_price)
@@ -146,7 +135,6 @@ class AuctionReplayEngine:
         ]
 
         for col in money_cols:
-
             self.bid_df[col] = (
                 self.bid_df[col]
                 .apply(self._parse_price)
@@ -174,12 +162,22 @@ class AuctionReplayEngine:
         # Sort data
         # ---------------------------------------------------------
 
-        self.player_df = (
-            self.player_df
-            .sort_values("id")
+        self.bid_df = (
+            self.bid_df
+            .sort_values(
+                ["playerId", "BidAmount"],
+                ascending=[True, True]
+            )
             .reset_index(drop=True)
         )
-
+        
+        # Recreate BidNumber within each player
+        self.bid_df["BidNumber"] = (
+            self.bid_df
+            .groupby("playerId")
+            .cumcount() + 1
+        )
+        
         VALID_STATUSES = {
             self.STATUS_SOLD,
             self.STATUS_UNSOLD,
@@ -209,36 +207,39 @@ class AuctionReplayEngine:
             .reset_index(drop=True)
         )
 
+        # player_df arrives in REVERSE bidding order (row 0 is the
+        # last player who went under the hammer). There's no explicit
+        # order column, so we recover chronological order by simply
+        # reversing the frame rather than sorting on anything.
+        self.player_df = self.player_df.iloc[::-1].reset_index(drop=True)
+
         # ---------------------------------------------------------
         # Participating teams
         # ---------------------------------------------------------
 
         self.teams = sorted(
-
             set(self.bid_df["Team"].dropna())
-
             |
-
             set(self.player_df["playsForTeam"].dropna())
-
         )
+
+        ROLE_ALIASES = {
+            "WK-BATTER": "WICKETKEEPER",
+            "ALLROUNDER": "ALL-ROUNDER",
+        }
+        self.player_df["role"] = self.player_df["role"].str.upper().replace(ROLE_ALIASES)
 
 
     def _parse_price(self, value):
         """
         Convert auction prices into numeric values (Lakhs).
-
         Examples
         --------
         "75 L"     -> 75
-
         "2 Cr"     -> 200
-
         "1.25 Cr"  -> 125
-
         np.nan     -> np.nan
         """
-
         if pd.isna(value):
             return np.nan
 
@@ -269,7 +270,6 @@ class AuctionReplayEngine:
 
         return amount
     
-
     def _initialize_team_state(self):
         """
         Initialize the dynamic state maintained for each team during
@@ -282,21 +282,15 @@ class AuctionReplayEngine:
         """
 
         self.team_state = {
-
             team: {
-
                 # Purse remaining
                 "remaining_purse": self.auction_max_purse,
-
                 # Number of players already acquired
                 "players_bought": 0,
-
                 # Squad slots remaining
                 "remaining_slots": self.squad_size,
-
                 # Overseas players already acquired
                 "overseas_bought": 0,
-
                 # Role composition
                 "batters_bought": 0,
                 "bowlers_bought": 0,
@@ -304,63 +298,45 @@ class AuctionReplayEngine:
                 "wicketkeepers_bought": 0,
 
             }
-
             for team in self.teams
-
         }
 
     def _apply_preauction_events(self):
         """
         Apply all auction events that occurred before the first player
         entered the auction.
-
         Currently this consists of retained players.
         """
-
         retained = self.player_df[
-
             self.player_df["auctionStatus"] == self.STATUS_RETAINED
-
         ]
-
         for _, player in retained.iterrows():
+            # A retention is economically identical to a sale: one
+            # player leaves the pool, one team's purse/slot/role
+            # counters move. Reuse _apply_sale so this can never
+            # drift out of sync with how a normal sale is applied.
+            self._apply_sale(player)
 
-            team = player["playsForTeam"]
+        ############################################################
+        # Remove retained players from the auction replay
+        ############################################################
 
-            if pd.isna(team):
-                continue
-
-            state = self.team_state[team]
-
-            price = player["auctionPrice"]
-
-            state["remaining_purse"] -= price
-
-            state["players_bought"] += 1
-
-            state["remaining_slots"] -= 1
-
-            if player["isPlayerOverseas"]:
-                state["overseas_bought"] += 1
-
-            self._increment_role_count(
-                state,
-                player["role"]
-            )
+        self.player_df = (
+            self.player_df[
+                self.player_df["auctionStatus"] != self.STATUS_RETAINED
+            ]
+            .reset_index(drop=True)
+        )
+        
 
     def _increment_role_count(self, state, role):
         role = role.upper()
 
         mapping = {
-
             "BATTER": "batters_bought",
-
             "BOWLER": "bowlers_bought",
-
             "ALL-ROUNDER": "allrounders_bought",
-
             "WICKETKEEPER": "wicketkeepers_bought",
-
         }
 
         key = mapping.get(role)
@@ -380,28 +356,19 @@ class AuctionReplayEngine:
         remaining = self.player_df.iloc[auction_order:]
 
         return {
-
             "auction_order": auction_order + 1,
-
             "players_completed": auction_order,
-
             "players_remaining": len(self.player_df) - auction_order,
-
             "remaining_batters":
                 (remaining["role"] == "BATTER").sum(),
-
             "remaining_bowlers":
                 (remaining["role"] == "BOWLER").sum(),
-
             "remaining_allrounders":
                 (remaining["role"] == "ALL-ROUNDER").sum(),
-
             "remaining_wicketkeepers":
                 (remaining["role"] == "WICKETKEEPER").sum(),
-
             "remaining_overseas":
                 remaining["isPlayerOverseas"].sum(),
-
         }
     
     def _build_bid_summary(
@@ -410,85 +377,62 @@ class AuctionReplayEngine:
     ):
         """
         Construct valuation observations for every team for a single player.
-
         Parameters
         ----------
         player : pd.Series
             Row from self.player_df.
-
         Returns
         -------
         dict
-
             {
-
                 team_name : {
-
                     "lower": ...,
-
                     "upper": ...,
-
                     "winner": ...,
-
                     "observation_type": ...
-
                 }
-
             }
 
         Notes
         -----
         This function is PURE.
-
         It never modifies team state.
         """
 
         player_bid_df = (
-
             self.bid_df[
-
                 self.bid_df["playerId"] == player["playerId"]
-
             ]
-
             .sort_values("BidNumber")
-
             .reset_index(drop=True)
-
-        )
+        )       
 
         status = player["auctionStatus"]
 
         if status == self.STATUS_SOLD:
-
             return self._summary_sold(
                 player,
                 player_bid_df,
             )
 
         elif status == self.STATUS_RTM:
-
             return self._summary_rtm(
                 player,
                 player_bid_df,
             )
 
         elif status == self.STATUS_RETAINED:
-
             return self._summary_retained(
                 player,
                 player_bid_df,
             )
-
         elif status == self.STATUS_UNSOLD:
-
             return self._summary_unsold(
                 player,
                 player_bid_df,
             )
 
         else:
-
             raise ValueError(
                 f"Unknown auction status: {status}"
             )
@@ -500,19 +444,12 @@ class AuctionReplayEngine:
         """
 
         return {
-
             team: {
-
                 "lower": np.nan,
-
                 "upper": np.nan,
-
                 "winner": False,
-
                 "observation_type": "unknown",
-
             }
-
             for team in self.teams
 
         }
@@ -525,62 +462,46 @@ class AuctionReplayEngine:
         Returns the artificial upper bound used for
         right-censored winner observations.
         """
-
         return winning_bid * 2
     
-    def _extract_team_bid_history(self, player_bid_df):
-        """
-        Extract bidding history for each team.
-
-        Returns
-        -------
-        dict
-
-        {
-
-            team : {
-
-                "entered": bool,
-
-                "all_bids": [...],
-
-                "last_bid": float,
-
-                "previous_bid": float,
-
-            }
-
-        }
-        """
+    def _extract_team_bid_history(
+        self,
+        player_bid_df,
+        base_price,
+    ):
 
         history = {}
-
+        # initialize
         for team in self.teams:
-
-            bids = (
-                player_bid_df.loc[
-                    player_bid_df["Team"] == team,
-                    "BidAmount"
-                ]
-                .tolist()
-            )
-
-            history[team] = {
-
-                "entered": len(bids) > 0,
-
-                "all_bids": bids,
-
-                "last_bid": bids[-1] if len(bids) else np.nan,
-
-                "previous_bid": (
-                    bids[-2]
-                    if len(bids) >= 2
-                    else player_bid_df["basePrice"].iloc[0]
-                ) if len(bids) else np.nan,
-
+            history[team] = {   
+                "entered": False, 
+                "all_bids": [], 
+                "last_bid": np.nan,  
+                "previous_bid": np.nan,
+                "next_bid": np.nan,
             }
-
+    
+        # collect bids
+        for _, row in player_bid_df.iterrows():
+            history[row["Team"]]["all_bids"].append(row["BidAmount"])
+    
+        # fill last/previous
+        for team in self.teams:
+            bids = history[team]["all_bids"]    
+            if len(bids) == 0:
+                continue    
+            history[team]["entered"] = True    
+            history[team]["last_bid"] = bids[-1]    
+            history[team]["previous_bid"] = (
+                bids[-2] if len(bids) >= 2 else base_price
+            )
+    
+        # compute next_bid
+        bids = player_bid_df.reset_index(drop=True)    
+        for i in range(len(bids) - 1):    
+            team = bids.loc[i, "Team"]    
+            history[team]["next_bid"] = bids.loc[i + 1, "BidAmount"]
+    
         return history
     
     def _summary_sold(
@@ -595,17 +516,15 @@ class AuctionReplayEngine:
         summary = self._empty_team_summary()
 
         history = self._extract_team_bid_history(
-            player_bid_df
+            player_bid_df,
+            player["basePrice"]
         )
 
         winner = player["playsForTeam"]
-
         winning_bid = player["auctionPrice"]
-
         base_price = player["basePrice"]
 
         for team in self.teams:
-
             info = history[team]
 
             ####################################################
@@ -613,17 +532,11 @@ class AuctionReplayEngine:
             ####################################################
 
             if not info["entered"]:
-
                 summary[team].update({
-
                     "lower": 0.01,
-
                     "upper": base_price,
-
                     "winner": False,
-
                     "observation_type": "left",
-
                 })
 
                 continue
@@ -633,38 +546,16 @@ class AuctionReplayEngine:
             ####################################################
 
             if team == winner:
-
-                highest_opponent = (
-
-                    player_bid_df[
-                        player_bid_df["Team"] != winner
-                    ]["BidAmount"]
-
-                    .max()
-
-                )
-
-                if pd.isna(highest_opponent):
-
-                    highest_opponent = base_price
-
                 summary[team].update({
-
-                    "previous_bid": info["previous_bid"],
-
-                    "last_bid": info["last_bid"],
-
-                    "lower": highest_opponent,
-
-                    "upper": self._winner_upper_bound(
-                        winning_bid
-                    ),
-
-                    "winner": True,
-
-                    "observation_type": "right",
-
-                })
+                "previous_bid": info["previous_bid"],
+                "last_bid": info["last_bid"],            
+                "lower": winning_bid,            
+                "upper": self._winner_upper_bound(
+                    winning_bid
+                ),            
+                "winner": True,            
+                "observation_type": "right",
+            })
 
                 continue
 
@@ -673,21 +564,15 @@ class AuctionReplayEngine:
             ####################################################
 
             summary[team].update({
-
                 "previous_bid": info["previous_bid"],
-
                 "last_bid": info["last_bid"],
-
                 "lower": info["last_bid"],
-
                 "upper": info["next_bid"],
-
                 "winner": False,
-
                 "observation_type": "interval",
-
             })
 
+        
         return summary
     
     def _summary_unsold(
@@ -698,17 +583,14 @@ class AuctionReplayEngine:
         """
         Construct valuation observations for an unsold player.
         """
-
         summary = self._empty_team_summary()
-
         history = self._extract_team_bid_history(
-            player_bid_df
+            player_bid_df,
+            player["basePrice"]
         )
-
         base_price = player["basePrice"]
 
         for team in self.teams:
-
             info = history[team]
 
             ###############################################
@@ -716,40 +598,14 @@ class AuctionReplayEngine:
             ###############################################
 
             if not info["entered"]:
-
                 summary[team].update({
-
                     "lower": 0.01,
-
                     "upper": base_price,
-
                     "winner": False,
-
                     "observation_type": "left",
-
                 })
 
                 continue
-
-            ###############################################
-            # Bidder
-            ###############################################
-
-            summary[team].update({
-
-                "previous_bid": info["previous_bid"],
-
-                "last_bid": info["last_bid"],
-
-                "lower": info["previous_bid"],
-
-                "upper": info["last_bid"],
-
-                "winner": False,
-
-                "observation_type": "interval",
-
-            })
 
         return summary
     
@@ -763,81 +619,37 @@ class AuctionReplayEngine:
         """
 
         summary = self._empty_team_summary()
-
         retained_team = player["playsForTeam"]
-
         retained_price = player["auctionPrice"]
 
         for team in self.teams:
-
             if team == retained_team:
-
                 summary[team].update({
-
                     "lower": retained_price,
-
                     "upper": self._winner_upper_bound(
                         retained_price
                     ),
-
                     "winner": True,
-
                     "observation_type": "right",
-
                 })
 
             else:
 
                 summary[team].update({
-
                     "lower": np.nan,
-
                     "upper": np.nan,
-
                     "winner": False,
-
                     "observation_type": "unknown",
-
                 })
 
         return summary
     
-    def _summary_rtm(
-        self,
-        player,
-        player_bid_df,
-    ):
+    def _summary_rtm(self, player, player_bid_df):
         """
-        Placeholder implementation for RTM players.
-
-        TODO
-        ----
-        Replace with the proper RTM valuation model.
+        RTM purchases are treated identically to normal sales for
+        valuation-interval purposes, for now.
         """
-
-        summary = self._empty_team_summary()
-
-        base_price = player["basePrice"]
-
-        for team in self.teams:
-
-            summary[team].update({
-
-                "previous_bid": np.nan,
-
-                "last_bid": np.nan,
-
-                "lower": 0.01,
-
-                "upper": base_price,
-
-                "winner": False,
-
-                "observation_type": "unknown",
-
-            })
-
-        return summary
+        return self._summary_sold(player, player_bid_df)
 
     def _player_metadata(
         self,
@@ -847,33 +659,19 @@ class AuctionReplayEngine:
         """
         Static metadata for a Player × Team training row.
         """
-
         return {
-
             "playerId": player["playerId"],
-
             "playerName": player["playerName"],
-
             "team": team,
-
             "role": player["role"],
-
             "country": player["country"],
-
             "countryId": player["countryId"],
-
             "cappedStatus": player["cappedStatus"],
-
             "isPlayerOverseas": player["isPlayerOverseas"],
-
             "basePrice": player["basePrice"],
-
             "auctionPrice": player["auctionPrice"],
-
             "auctionStatus": player["auctionStatus"],
-
             "playsForTeam": player["playsForTeam"],
-
         }
     
     def _build_player_training_rows(
@@ -883,11 +681,8 @@ class AuctionReplayEngine:
     ):
         """
         Construct all training rows for a single player.
-
         One row is produced for every team.
-
         This function is PURE.
-
         It snapshots the current auction state but DOES NOT modify it.
         """
 
@@ -912,18 +707,15 @@ class AuctionReplayEngine:
         ############################################################
 
         for team in self.teams:
-
             ########################################################
             # Components
             ########################################################
-
             player_info = self._player_metadata(
                 player,
                 team,
             )
 
             team_state = self.team_state[team].copy()
-
             interval = bid_summary[team].copy()
 
             ########################################################
@@ -931,39 +723,26 @@ class AuctionReplayEngine:
             ########################################################
 
             auction_state_row = {
-
                 **player_info,
-
                 **auction_state,
-
             }
 
             team_state_row = {
-
-                **player_info,
-
-                **team_state,
-
+                **player_info,            
+                **auction_state,            
+                **team_state,            
             }
 
             bid_summary_row = {
-
                 **player_info,
-
                 **interval,
-
             }
 
             training_row = {
-
                 **player_info,
-
                 **auction_state,
-
                 **team_state,
-
                 **interval,
-
             }
 
             ########################################################
@@ -1012,7 +791,6 @@ class AuctionReplayEngine:
         ############################################################
 
         state["players_bought"] += 1
-
         state["remaining_slots"] -= 1
 
         ############################################################
@@ -1020,7 +798,6 @@ class AuctionReplayEngine:
         ############################################################
 
         if player["isPlayerOverseas"]:
-
             state["overseas_bought"] += 1
 
         ############################################################
@@ -1041,7 +818,6 @@ class AuctionReplayEngine:
 
         Therefore this method intentionally does nothing.
         """
-
         return
     
     def _apply_unsold(
@@ -1051,7 +827,6 @@ class AuctionReplayEngine:
         """
         Unsold players do not modify team state.
         """
-
         return
 
     def _apply_rtm(
@@ -1061,11 +836,13 @@ class AuctionReplayEngine:
         """
         Apply an RTM purchase.
 
-        TODO:
-            Implement once RTM valuation modelling is finalized.
+        For now, an RTM buy is treated identically to a normal sale
+        for team-state purposes (purse/slot/overseas/role counters).
+        RTM-specific valuation modelling (bid_summary bounds) is a
+        separate TODO — see _summary_rtm.
         """
 
-        pass
+        self._apply_sale(player)
 
     def _apply_player_result(
         self,
@@ -1075,27 +852,20 @@ class AuctionReplayEngine:
         Advance the auction state by applying the current player's
         auction outcome.
         """
-
         status = player["auctionStatus"]
-
         if status == self.STATUS_SOLD:
-
             self._apply_sale(player)
 
         elif status == self.STATUS_RETAINED:
-
             self._apply_retention(player)
 
         elif status == self.STATUS_UNSOLD:
-
             self._apply_unsold(player)
 
         elif status == self.STATUS_RTM:
-
             self._apply_rtm(player)
 
         else:
-
             raise ValueError(
                 f"Unknown auction status: {status}"
             )
@@ -1111,15 +881,10 @@ class AuctionReplayEngine:
         dict
 
             {
-
                 "training": DataFrame,
-
                 "auction_state": DataFrame,
-
                 "team_state": DataFrame,
-
                 "bid_summary": DataFrame,
-
             }
         """
 
@@ -1128,15 +893,10 @@ class AuctionReplayEngine:
         ############################################################
 
         self.outputs = {
-
             "training": [],
-
             "auction_state": [],
-
             "team_state": [],
-
             "bid_summary": [],
-
         }
 
         ############################################################
@@ -1144,7 +904,6 @@ class AuctionReplayEngine:
         ############################################################
 
         self._initialize_team_state()
-
         self._apply_preauction_events()
 
         ############################################################
@@ -1154,7 +913,6 @@ class AuctionReplayEngine:
         for auction_order, (_, player) in enumerate(
             self.player_df.iterrows()
         ):
-
             self._build_player_training_rows(
                 player,
                 auction_order,
@@ -1169,14 +927,6 @@ class AuctionReplayEngine:
         ############################################################
 
         return {
-
             key: pd.DataFrame(value)
-
             for key, value in self.outputs.items()
-
         }
-        
-
-    
-
-    
