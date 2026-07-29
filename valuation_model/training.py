@@ -59,6 +59,7 @@ def train_one_epoch(
             lower_bid=batch["lower_bid"],
             upper_bid=batch["upper_bid"],
             observation_type=batch["observation_type"],
+            weight=batch["weight"],
         )
 
         loss = stats["loss"]
@@ -163,6 +164,7 @@ def validate_one_epoch(
             lower_bid=batch["lower_bid"],
             upper_bid=batch["upper_bid"],
             observation_type=batch["observation_type"],
+            weight=batch["weight"],
         )
 
         ########################################################

@@ -14,6 +14,27 @@ class IPLAuctionDataset(Dataset):
 
         self.training_df = training_df.copy()
 
+        ########################################################
+        # Drop rows with no real signal.
+        #
+        # "unknown" rows (e.g. every non-retaining team on a
+        # retained player) have lower=NaN, upper=NaN by design --
+        # they mean "we don't know this team's valuation", not
+        # "this team valued the player near zero". Keeping them
+        # and fillna(0)-ing the bounds would silently turn every
+        # one of these into a fake (0.001, 0.002) interval, which
+        # trains the model to think most team/player pairs are
+        # worthless. So they're excluded here, before any tensors
+        # are built.
+        ########################################################
+
+        self.training_df = (
+            self.training_df[
+                self.training_df["observation_type"] != "unknown"
+            ]
+            .reset_index(drop=True)
+        )
+
         self.encoder_manager = encoder_manager
 
         ########################################################
@@ -110,6 +131,37 @@ class IPLAuctionDataset(Dataset):
         )
 
         ########################################################
+        # Class-balanced sample weights
+        #
+        # "left" (never-bid) rows are typically the large majority
+        # -- every team that didn't bid on a player gets one -- so
+        # an unweighted mean loss mostly teaches the model "most
+        # team/player pairs are worth very little". These weights
+        # rescale each observation_type to contribute equally in
+        # aggregate, so the comparatively rare but far more
+        # informative "interval"/"right" (actual bid/sale) rows
+        # aren't drowned out.
+        ########################################################
+
+        type_counts = self.training_df["observation_type"].value_counts()
+
+        num_classes = len(type_counts)
+        total_rows = len(self.training_df)
+
+        class_weight = {
+            obs_type: total_rows / (num_classes * count)
+            for obs_type, count in type_counts.items()
+        }
+
+        self.sample_weight = torch.tensor(
+            self.training_df["observation_type"]
+            .map(class_weight)
+            .to_numpy(dtype=np.float32),
+
+            dtype=torch.float32,
+        )
+
+        ########################################################
         # Targets
         ########################################################
 
@@ -192,6 +244,9 @@ class IPLAuctionDataset(Dataset):
 
             "observation_type":
                 self.observation_type[idx],
+
+            "weight":
+                self.sample_weight[idx],
 
             ####################################################
             # Metadata

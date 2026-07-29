@@ -32,6 +32,7 @@ class IntervalCensoredLoss(nn.Module):
         lower_bid,
         upper_bid,
         observation_type=None,  # kept for backward compatibility
+        weight=None,
     ):
 
         ########################################################
@@ -93,7 +94,10 @@ class IntervalCensoredLoss(nn.Module):
         # Prevent rare pathological samples from exploding
         nll = torch.clamp(nll, max=50.0)
 
-        loss = nll.mean()
+        if weight is not None:
+            loss = (nll * weight).sum() / weight.sum().clamp(min=self.eps)
+        else:
+            loss = nll.mean()
 
         ########################################################
         # Return
