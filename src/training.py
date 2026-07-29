@@ -252,23 +252,21 @@ def run_training_pipeline_with_holdout(
         player_role_df=player_role_df,
     )
 
-    train_df = pd.concat(
-        [
-            train_df.reset_index(drop=True),
-            role_frame.iloc[: len(train_df)].reset_index(drop=True),
-        ],
-        axis=1,
-    )
+    # Preserve existing attrs 
+    train_attrs = dict(train_df.attrs) 
+    val_attrs = dict(val_df.attrs)
 
-    val_df = pd.concat(
-        [
-            val_df.reset_index(drop=True),
-            role_frame.iloc[len(train_df):].reset_index(drop=True),
-        ],
-        axis=1,
-    )
+    train_roles = role_frame.iloc[: len(train_df)].reset_index(drop=True) 
+    val_roles = role_frame.iloc[len(train_df):].reset_index(drop=True)
 
-    train_df.attrs["role_columns"] = role_columns
+    train_df = pd.concat( [train_df.reset_index(drop=True), train_roles], axis=1, )
+
+    val_df = pd.concat( [val_df.reset_index(drop=True), val_roles], axis=1, )
+
+    # Restore attrs and add role columns 
+    train_df.attrs = train_attrs 
+    val_df.attrs = val_attrs 
+    train_df.attrs["role_columns"] = role_columns 
     val_df.attrs["role_columns"] = role_columns
 
     train_dataset = IPLAuctionDataset(train_df, encoder_manager)
