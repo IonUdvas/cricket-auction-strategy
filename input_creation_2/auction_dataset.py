@@ -36,6 +36,8 @@ class IPLAuctionDataset(Dataset):
             .reset_index(drop=True)
         )
 
+        self.training_df = self.training_df[ self.training_df["observation_type"].isin([ "winner", "competing_bidder" ]) ].reset_index(drop=True)
+
         self.encoder_manager = encoder_manager
 
         ########################################################
