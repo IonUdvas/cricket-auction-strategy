@@ -3,7 +3,7 @@ seed: 42
 training:
   epochs: 20
   batch_size: 256
-  learning_rate: 3e-4
+  learning_rate: 0.0003
   weight_decay: 0.0
 
 model:
