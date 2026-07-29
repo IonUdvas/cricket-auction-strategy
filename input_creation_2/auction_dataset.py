@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 import torch
 
 from torch.utils.data import Dataset
@@ -136,27 +137,80 @@ class IPLAuctionDataset(Dataset):
         # "left" (never-bid) rows are typically the large majority
         # -- every team that didn't bid on a player gets one -- so
         # an unweighted mean loss mostly teaches the model "most
-        # team/player pairs are worth very little". These weights
-        # rescale each observation_type to contribute equally in
-        # aggregate, so the comparatively rare but far more
-        # informative "interval"/"right" (actual bid/sale) rows
-        # aren't drowned out.
+        # team/player pairs are worth very little".
+        #
+        # Balancing by observation_type alone still leaves a
+        # second imbalance inside "right"/"interval": a handful of
+        # marquee, high-price sales get outvoted by many
+        # ordinary-priced ones of the *same* type, so the model
+        # keeps regressing expensive players toward the pack.
+        #
+        # So weights are stratified on the *joint* key
+        # (observation_type, price_bracket) rather than type alone.
+        # This is deliberately NOT type_weight * price_weight --
+        # multiplying two independently-balanced weights would let
+        # a rare-type + rare-price row (e.g. one very expensive
+        # winner) dominate a whole batch. Balancing the compound
+        # key directly keeps every (type, price bracket) bucket
+        # contributing equally, without that runaway effect.
         ########################################################
 
-        type_counts = self.training_df["observation_type"].value_counts()
+        log_midpoint = np.log(
+            np.clip(
+                (
+                    self.training_df["lower"].to_numpy(dtype=np.float64)
+                    + self.training_df["upper"].to_numpy(dtype=np.float64)
+                )
+                / 2.0,
+                1e-3,
+                None,
+            )
+        )
 
-        num_classes = len(type_counts)
+        num_price_bins = 6
+
+        def _bin_within_type(group):
+            try:
+                return pd.qcut(
+                    group,
+                    q=num_price_bins,
+                    labels=False,
+                    duplicates="drop",
+                )
+            except (ValueError, IndexError):
+                # Too few rows/unique values in this observation_type
+                # to form quantile bins (e.g. a small validation
+                # split) -- collapse to a single price bracket for
+                # that type.
+                return pd.Series(
+                    np.zeros(len(group), dtype=int),
+                    index=group.index,
+                )
+
+        price_bin = (
+            pd.Series(log_midpoint, index=self.training_df.index)
+            .groupby(self.training_df["observation_type"])
+            .transform(_bin_within_type)
+        )
+
+        strata = (
+            self.training_df["observation_type"].astype(str)
+            + "_"
+            + pd.Series(price_bin, index=self.training_df.index).astype(str)
+        )
+
+        strata_counts = strata.value_counts()
+
+        num_strata = len(strata_counts)
         total_rows = len(self.training_df)
 
-        class_weight = {
-            obs_type: total_rows / (num_classes * count)
-            for obs_type, count in type_counts.items()
+        strata_weight = {
+            key: total_rows / (num_strata * count)
+            for key, count in strata_counts.items()
         }
 
         self.sample_weight = torch.tensor(
-            self.training_df["observation_type"]
-            .map(class_weight)
-            .to_numpy(dtype=np.float32),
+            strata.map(strata_weight).to_numpy(dtype=np.float32),
 
             dtype=torch.float32,
         )
