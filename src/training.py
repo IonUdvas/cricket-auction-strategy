@@ -280,6 +280,12 @@ def run_training_pipeline_with_holdout(
         valid_loader=val_loader,
     )
 
+    val_predictions = evaluate_predictions(
+        model=model,
+        dataset=val_dataset,
+        device=device,
+    )
+
     return {
         "model": model,
         "history": history,
@@ -290,4 +296,5 @@ def run_training_pipeline_with_holdout(
         "val_loader": val_loader,
         "train_df": train_df,
         "val_df": val_df,
+        "val_predictions": val_predictions,
     }
