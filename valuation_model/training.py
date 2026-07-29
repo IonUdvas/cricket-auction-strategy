@@ -52,7 +52,7 @@ def train_one_epoch(
 
         output = model(
             batch["player_features"],
-            batch["role"],
+            batch["role_features"],
             batch["team"],
             batch["team_state"],
             batch["auction_state"],
@@ -164,7 +164,7 @@ def validate_one_epoch(
 
         output = model(
             batch["player_features"],
-            batch["role"],
+            batch["role_features"],
             batch["team"],
             batch["team_state"],
             batch["auction_state"],
@@ -250,7 +250,7 @@ def predict(
 
         output = model(
             batch["player_features"],
-            batch["role"],
+            batch["role_features"],
             batch["team"],
             batch["team_state"],
             batch["auction_state"],

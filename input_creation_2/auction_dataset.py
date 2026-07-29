@@ -107,16 +107,19 @@ class IPLAuctionDataset(Dataset):
             dtype=torch.long,
         )
 
-        self.role = torch.tensor(
+        self.role_columns = (
+            training_df.attrs["role_columns"]
+        )
 
-            self.encoder_manager
-            .get_encoder("role")
-            .transform(
-                self.training_df["role"]
-            )
-            .values,
+        self.role_features = torch.tensor(
 
-            dtype=torch.long,
+            self.training_df[
+                self.role_columns
+            ]
+            .fillna(0)
+            .to_numpy(dtype=np.float32),
+
+            dtype=torch.float32,
         )
 
         self.observation_type = torch.tensor(
@@ -283,8 +286,8 @@ class IPLAuctionDataset(Dataset):
             "team":
                 self.team[idx],
 
-            "role":
-                self.role[idx],
+            "role_features":
+                self.role_features[idx],
 
             ####################################################
             # Targets

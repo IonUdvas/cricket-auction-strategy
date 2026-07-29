@@ -7,15 +7,27 @@ class IntrinsicValuationNetwork(nn.Module):
     def __init__(
         self,
         player_dim,
-        num_archetypes,
+        num_role_features,
         num_teams,
         embedding_dim=16,
     ):
         super().__init__()
 
-        self.archetype_embedding = nn.Embedding(
-            num_archetypes,
-            embedding_dim
+        # A player's role is a multi-hot vector (a player can be
+        # RHB *and* pace *and* death_overs_bowler *and*
+        # bowling_allrounder at once) rather than one mutually
+        # exclusive category, so this is a Linear projection rather
+        # than an nn.Embedding lookup. Note this is a strict
+        # generalization, not a behavior change for the old
+        # single-role case: a Linear layer (no bias) applied to a
+        # one-hot vector is mathematically identical to an embedding
+        # lookup -- each column of the weight matrix is exactly the
+        # "embedding" for that role/tag -- and for a multi-hot input
+        # it naturally sums the tag embeddings of every active tag.
+        self.role_proj = nn.Linear(
+            num_role_features,
+            embedding_dim,
+            bias=False,
         )
 
         self.team_embedding = nn.Embedding(
@@ -42,11 +54,11 @@ class IntrinsicValuationNetwork(nn.Module):
     def forward(
         self,
         player_features,
-        archetype,
+        role_features,
         team
     ):
 
-        a = self.archetype_embedding(archetype)
+        a = self.role_proj(role_features)
         t = self.team_embedding(team)
 
         x = torch.cat(
@@ -124,14 +136,14 @@ class ValuationModel(nn.Module):
         player_dim,
         team_state_dim,
         auction_state_dim,
-        num_archetypes,
+        num_role_features,
         num_teams,
         embedding_dim=16
     ):
         super().__init__()
         self.intrinsic = IntrinsicValuationNetwork(
             player_dim=player_dim,
-            num_archetypes=num_archetypes,
+            num_role_features=num_role_features,
             num_teams=num_teams,
             embedding_dim=embedding_dim
         )
@@ -144,7 +156,7 @@ class ValuationModel(nn.Module):
     def forward(
         self,
         player_features,
-        archetype,
+        role_features,
         team,
         team_state,
         auction_state
@@ -154,12 +166,12 @@ class ValuationModel(nn.Module):
         assert torch.isfinite(team_state).all(), "team_state contains NaN/Inf"
         assert torch.isfinite(auction_state).all(), "auction_state contains NaN/Inf"
 
-        assert torch.isfinite(archetype.float()).all()
+        assert torch.isfinite(role_features).all()
         assert torch.isfinite(team.float()).all()
     
         mu, sigma = self.intrinsic(
             player_features,
-            archetype,
+            role_features,
             team
         )
     

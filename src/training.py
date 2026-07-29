@@ -1,4 +1,8 @@
-from input_creation_2.auction_dataset_utils import build_training_samples, build_encoders
+from input_creation_2.auction_dataset_utils import (
+    build_training_samples,
+    build_encoders,
+    build_role_table,
+)
 from input_creation_2.auction_dataset import IPLAuctionDataset
 from valuation_model.models import *
 from valuation_model.losses import *
@@ -103,10 +107,30 @@ def load_and_encode_data(full_training_df):
 def run_training_pipeline(
         player_template,
         bid_template,
-        parquet_path
+        parquet_path,
+        player_role_df=None,
 ):
     
     full_training_df = build_training_df(player_template, bid_template, parquet_path)
+
+    ################################################################
+    # Player roles, built once on the full concatenated frame -- see
+    # the note in build_training_samples for why this doesn't happen
+    # per-year.
+    ################################################################
+
+    role_frame, role_columns = build_role_table(
+        full_training_df,
+        player_role_df=player_role_df,
+    )
+
+    full_training_df = pd.concat(
+        [full_training_df.reset_index(drop=True), role_frame],
+        axis=1,
+    )
+
+    full_training_df.attrs["role_columns"] = role_columns
+
     encoder_manager, dataset, loader = load_and_encode_data(full_training_df)
 
     config["model"]["player_dim"] = len(
@@ -121,8 +145,8 @@ def run_training_pipeline(
         full_training_df.attrs["auction_state_columns"]
     )
 
-    config["model"]["num_archetypes"] = len(
-        encoder_manager.get_encoder("role").classes_
+    config["model"]["num_role_features"] = len(
+        full_training_df.attrs["role_columns"]
     )
 
     config["model"]["num_teams"] = len(
@@ -133,7 +157,7 @@ def run_training_pipeline(
         player_dim=config["model"]["player_dim"],
         team_state_dim=config["model"]["team_state_dim"],
         auction_state_dim=config["model"]["auction_state_dim"],
-        num_archetypes=config["model"]["num_archetypes"],
+        num_role_features=config["model"]["num_role_features"],
         num_teams=config["model"]["num_teams"],
         embedding_dim=config["model"]["embedding_dim"]
 
@@ -173,6 +197,7 @@ def run_training_pipeline_with_holdout(
         parquet_path,
         train_years,
         val_years,
+        player_role_df=None,
 ):
     """
     Same as run_training_pipeline, but builds train_years and val_years
@@ -199,15 +224,52 @@ def run_training_pipeline_with_holdout(
 
     ################################################################
     # Fit encoders on the UNION of train + val categories.
-    # This only fixes team/role/observation_type vocabulary --
-    # it does not leak any auction outcome / target information --
-    # but is required because the encoder has no "unknown" bucket
-    # and will crash on a category it has never seen.
+    # This only fixes team/observation_type vocabulary -- it does
+    # not leak any auction outcome / target information -- but is
+    # required because the encoder has no "unknown" bucket and will
+    # crash on a category it has never seen.
     ################################################################
 
     combined_df = pd.concat([train_df, val_df], ignore_index=True)
 
     encoder_manager = build_encoders(combined_df)
+
+    ################################################################
+    # Player roles, built once on the same train+val union and then
+    # split back by position. player_role_df itself is a player-level
+    # table (no auction outcome in it), so this isn't a leakage
+    # concern the way the encoder fit above is -- the point here is
+    # just guaranteeing train and val land on one shared set of role
+    # columns, the same way they share one team/observation_type
+    # vocabulary. Building it separately per split could otherwise
+    # give each split a different column set (most visibly for the
+    # legacy one-hot fallback, e.g. val_years happening not to
+    # contain any WICKETKEEPER-listed player that auction).
+    ################################################################
+
+    role_frame, role_columns = build_role_table(
+        combined_df,
+        player_role_df=player_role_df,
+    )
+
+    train_df = pd.concat(
+        [
+            train_df.reset_index(drop=True),
+            role_frame.iloc[: len(train_df)].reset_index(drop=True),
+        ],
+        axis=1,
+    )
+
+    val_df = pd.concat(
+        [
+            val_df.reset_index(drop=True),
+            role_frame.iloc[len(train_df):].reset_index(drop=True),
+        ],
+        axis=1,
+    )
+
+    train_df.attrs["role_columns"] = role_columns
+    val_df.attrs["role_columns"] = role_columns
 
     train_dataset = IPLAuctionDataset(train_df, encoder_manager)
     val_dataset = IPLAuctionDataset(val_df, encoder_manager)
@@ -241,8 +303,8 @@ def run_training_pipeline_with_holdout(
         train_df.attrs["auction_state_columns"]
     )
 
-    config["model"]["num_archetypes"] = len(
-        encoder_manager.get_encoder("role").classes_
+    config["model"]["num_role_features"] = len(
+        train_df.attrs["role_columns"]
     )
 
     config["model"]["num_teams"] = len(
@@ -253,7 +315,7 @@ def run_training_pipeline_with_holdout(
         player_dim=config["model"]["player_dim"],
         team_state_dim=config["model"]["team_state_dim"],
         auction_state_dim=config["model"]["auction_state_dim"],
-        num_archetypes=config["model"]["num_archetypes"],
+        num_role_features=config["model"]["num_role_features"],
         num_teams=config["model"]["num_teams"],
         embedding_dim=config["model"]["embedding_dim"],
     )
