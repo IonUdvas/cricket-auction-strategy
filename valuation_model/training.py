@@ -10,9 +10,19 @@ def train_one_epoch(
     criterion,
     optimizer,
     device,
+    max_grad_norm=5.0,
 ):
     """
     Train the model for one epoch.
+
+    Parameters
+    ----------
+    max_grad_norm : float or None
+        Clip the global gradient norm to this value before each
+        optimizer step. This is the runaway-update guard for
+        pathological samples (replacing the old nll.clamp(max=50),
+        which zeroed gradients instead of bounding them -- see
+        losses.py). Set to None to disable.
 
     Returns
     -------
@@ -71,6 +81,12 @@ def train_one_epoch(
         optimizer.zero_grad()
 
         loss.backward()
+
+        if max_grad_norm is not None:
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=max_grad_norm,
+            )
 
         optimizer.step()
 
@@ -288,7 +304,14 @@ def evaluate_predictions(
     sigma = preds["sigma"]
 
     predicted_median_value = np.exp(mu_effective)
-    predicted_mean_value = np.exp(mu_effective + 0.5 * sigma ** 2)
+
+    # Clip the exponent, not the inputs: with a still-mispriced model
+    # (or sigma near its 3.0 ceiling) mu_effective + 0.5*sigma^2 can
+    # be large enough that np.exp overflows to inf and warns. 700 is
+    # comfortably past float64's ~709 overflow point, so this only
+    # ever affects display of already-nonsensical predictions.
+    mean_log_value = np.clip(mu_effective + 0.5 * sigma ** 2, a_min=None, a_max=700.0)
+    predicted_mean_value = np.exp(mean_log_value)
 
     metadata_columns = [
         c for c in [
@@ -345,9 +368,16 @@ def train(
     device,
     epochs,
     valid_loader=None,
+    max_grad_norm=5.0,
 ):
     """
     Complete training loop.
+
+    Parameters
+    ----------
+    max_grad_norm : float or None
+        Passed through to `train_one_epoch` each epoch -- see there
+        for why this replaced the old nll clamp.
 
     Returns
     -------
@@ -372,6 +402,7 @@ def train(
             criterion=criterion,
             optimizer=optimizer,
             device=device,
+            max_grad_norm=max_grad_norm,
         )
 
         history["train"].append(train_stats)
