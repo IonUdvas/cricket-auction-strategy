@@ -1,4 +1,7 @@
+import numpy as np
 import torch
+
+from torch.utils.data import DataLoader
 
 
 def train_one_epoch(
@@ -192,6 +195,144 @@ def validate_one_epoch(
         running[key] /= len(loader)
 
     return running
+
+
+@torch.no_grad()
+def predict(
+    model,
+    dataset,
+    device,
+    batch_size=256,
+):
+    """
+    Run the model over every row of `dataset`, in original row order.
+
+    Returns
+    -------
+    dict of np.ndarray, each length == len(dataset):
+        "mu", "sigma", "mu_effective"
+    """
+
+    model.eval()
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+    )
+
+    mus, sigmas, mu_effectives = [], [], []
+
+    for batch in loader:
+
+        batch = {
+            key: value.to(device) if torch.is_tensor(value) else value
+            for key, value in batch.items()
+        }
+
+        output = model(
+            batch["player_features"],
+            batch["role"],
+            batch["team"],
+            batch["team_state"],
+            batch["auction_state"],
+        )
+
+        mus.append(output["mu"].squeeze(-1).cpu())
+        sigmas.append(output["sigma"].squeeze(-1).cpu())
+        mu_effectives.append(output["mu_effective"].squeeze(-1).cpu())
+
+    return {
+        "mu": torch.cat(mus).numpy(),
+        "sigma": torch.cat(sigmas).numpy(),
+        "mu_effective": torch.cat(mu_effectives).numpy(),
+    }
+
+
+def evaluate_predictions(
+    model,
+    dataset,
+    device,
+    batch_size=256,
+):
+    """
+    Compare model predictions against the actual observed auction
+    outcome for every row in `dataset`, aligned 1:1 with
+    dataset.training_df.
+
+    Since mu / mu_effective live in log-space (the model outputs the
+    parameters of a LogNormal), predicted point estimates are
+    converted back to real bid units here:
+
+        median value = exp(mu_effective)
+        mean value   = exp(mu_effective + sigma^2 / 2)
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per (player, team) observation, with predicted
+        valuation columns alongside the actual lower/upper bid
+        interval that was observed in that auction.
+    """
+
+    preds = predict(
+        model,
+        dataset,
+        device,
+        batch_size=batch_size,
+    )
+
+    mu_effective = preds["mu_effective"]
+    sigma = preds["sigma"]
+
+    predicted_median_value = np.exp(mu_effective)
+    predicted_mean_value = np.exp(mu_effective + 0.5 * sigma ** 2)
+
+    metadata_columns = [
+        c for c in [
+            "playerName",
+            "team",
+            "role",
+            "basePrice",
+            "auctionPrice",
+            "playsForTeam",
+            "auctionStatus",
+            "observation_type",
+        ]
+        if c in dataset.training_df.columns
+    ]
+
+    comparison = (
+        dataset.training_df[metadata_columns]
+        .copy()
+        .reset_index(drop=True)
+    )
+
+    comparison["winner"] = dataset.winner.numpy()
+    comparison["lower_bid"] = dataset.lower_bid.numpy()
+    comparison["upper_bid"] = dataset.upper_bid.numpy()
+
+    comparison["predicted_mu"] = preds["mu"]
+    comparison["predicted_mu_effective"] = mu_effective
+    comparison["predicted_sigma"] = sigma
+    comparison["predicted_median_value"] = predicted_median_value
+    comparison["predicted_mean_value"] = predicted_mean_value
+
+    # Did the predicted median valuation fall inside the observed
+    # (lower, upper) bid interval for that team/player?
+    comparison["within_interval"] = (
+        (comparison["predicted_median_value"] >= comparison["lower_bid"])
+        & (comparison["predicted_median_value"] <= comparison["upper_bid"])
+    )
+
+    # For rows where the team actually won the player, this is a
+    # direct point-estimate error against the real auction price.
+    if "auctionPrice" in comparison.columns:
+        comparison["error_vs_auction_price"] = (
+            comparison["predicted_median_value"] - comparison["auctionPrice"]
+        )
+
+    return comparison
 
 
 def train(
