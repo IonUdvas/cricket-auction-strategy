@@ -343,6 +343,46 @@ def evaluate_predictions(
     comparison["predicted_median_value"] = predicted_median_value
     comparison["predicted_mean_value"] = predicted_mean_value
 
+    ########################################################
+    # Predicted (mu - 3*sigma, mu + 3*sigma) band, mapped back
+    # to real price units. This is a check on the whole
+    # predictive distribution, not just the median point
+    # estimate -- under a LogNormal this band covers ~99.7% of
+    # the distribution's mass, so a well-calibrated model should
+    # have the true outcome fall inside it the large majority of
+    # the time. Clip the exponent for the same overflow reason
+    # as predicted_mean_value above.
+    ########################################################
+
+    band_low_log = np.clip(mu_effective - 3.0 * sigma, a_min=-700.0, a_max=700.0)
+    band_high_log = np.clip(mu_effective + 3.0 * sigma, a_min=-700.0, a_max=700.0)
+
+    comparison["predicted_band_low"] = np.exp(band_low_log)
+    comparison["predicted_band_high"] = np.exp(band_high_log)
+
+    # What actually happened: the real sale price for winners,
+    # otherwise the midpoint of the observed censoring interval
+    # as the best available stand-in for "true value".
+    actual_reference = comparison["lower_bid"].to_numpy(dtype=np.float64)
+    if "auctionPrice" in comparison.columns:
+        actual_reference = np.where(
+            comparison["winner"].to_numpy()
+            & comparison["auctionPrice"].notna().to_numpy(),
+            comparison["auctionPrice"].to_numpy(dtype=np.float64),
+            (
+                comparison["lower_bid"].to_numpy(dtype=np.float64)
+                + comparison["upper_bid"].to_numpy(dtype=np.float64)
+            )
+            / 2.0,
+        )
+
+    comparison["actual_reference_value"] = actual_reference
+
+    comparison["within_3sigma_band"] = (
+        (actual_reference >= comparison["predicted_band_low"])
+        & (actual_reference <= comparison["predicted_band_high"])
+    )
+
     # Did the predicted median valuation fall inside the observed
     # (lower, upper) bid interval for that team/player?
     comparison["within_interval"] = (

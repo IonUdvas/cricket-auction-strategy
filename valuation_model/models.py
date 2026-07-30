@@ -51,6 +51,23 @@ class IntrinsicValuationNetwork(nn.Module):
         self.mu_head = nn.Linear(64,1)
         self.sigma_head = nn.Linear(64,1)
 
+        # Bound sigma smoothly in [sigma_min, sigma_max] via a
+        # sigmoid, rather than an unbounded softplus that only gets
+        # clamped later inside the loss. torch.clamp has zero
+        # gradient outside its range, so once raw sigma drifted past
+        # the loss's clamp ceiling there was nothing pulling it back
+        # down -- and nothing stopping it from growing further, since
+        # doing so cost nothing once already clamped. A wide sigma
+        # then makes almost any interval look plausible regardless of
+        # mu, which is a cheap way to reduce loss without learning
+        # accurate point valuations. Sigmoid bounding removes that
+        # escape hatch structurally: sigma literally cannot leave
+        # [sigma_min, sigma_max], and the gradient stays nonzero
+        # everywhere (just small at the extremes), so there's always
+        # some pull back toward the interior.
+        self.sigma_min = 0.05
+        self.sigma_max = 3.0
+
     def forward(
         self,
         player_features,
@@ -68,23 +85,11 @@ class IntrinsicValuationNetwork(nn.Module):
 
         h = self.network(x)
 
-        # h = x
-
-        # for i, layer in enumerate(self.network):
-
-        #     h = layer(h)
-
-        #     print(i, layer, torch.isfinite(h).all())
-
-        #     if not torch.isfinite(h).all():
-        #         print(h)
-        #         raise RuntimeError
-
         mu = self.mu_head(h)
 
-        sigma = F.softplus(
-            self.sigma_head(h)
-        ) + 1e-6
+        sigma = self.sigma_min + (
+            self.sigma_max - self.sigma_min
+        ) * torch.sigmoid(self.sigma_head(h))
 
         return mu,sigma
 
