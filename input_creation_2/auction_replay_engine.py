@@ -223,11 +223,53 @@ class AuctionReplayEngine:
             set(self.player_df["playsForTeam"].dropna())
         )
 
-        ROLE_ALIASES = {
-            "WK-BATTER": "WICKETKEEPER",
-            "ALLROUNDER": "ALL-ROUNDER",
-        }
-        self.player_df["role"] = self.player_df["role"].str.upper().replace(ROLE_ALIASES)
+        CANONICAL_ROLES = {"BATTER", "BOWLER", "ALL-ROUNDER", "WICKETKEEPER"}
+
+        def _normalize_role(role):
+            """
+            Collapse any raw role string onto one of the four
+            canonical roles. Exact aliases are checked first;
+            anything else falls back to keyword matching so
+            compound labels (e.g. "Bowler Allrounder",
+            "Batting Allrounder", "WK-Batsman") still land on the
+            right bucket instead of silently becoming their own
+            unrecognized category -- which previously caused
+            _increment_role_count and _snapshot_auction_state's
+            remaining_bowlers/remaining_allrounders to undercount
+            any player whose role wasn't an exact-match string.
+            """
+            role = str(role).upper().strip()
+
+            exact_aliases = {
+                "WK-BATTER": "WICKETKEEPER",
+                "ALLROUNDER": "ALL-ROUNDER",
+            }
+
+            if role in exact_aliases:
+                return exact_aliases[role]
+
+            if role in CANONICAL_ROLES:
+                return role
+
+            compact = role.replace("-", "").replace(" ", "")
+
+            if "ALLROUNDER" in compact:
+                return "ALL-ROUNDER"
+            if "WK" in compact or "WICKETKEEPER" in compact:
+                return "WICKETKEEPER"
+            if "BOWL" in compact:
+                return "BOWLER"
+            if "BAT" in compact:
+                return "BATTER"
+
+            # Nothing matched -- fail loudly rather than silently
+            # dropping this player out of every role-based count.
+            raise ValueError(
+                f"Unrecognized player role: {role!r}. Add it to "
+                f"_normalize_role's alias/keyword handling."
+            )
+
+        self.player_df["role"] = self.player_df["role"].apply(_normalize_role)
 
 
     def _parse_price(self, value):
