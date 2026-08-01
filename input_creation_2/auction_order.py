@@ -175,6 +175,43 @@ def resolve_auction_order(player_df, max_purse, verbose=True):
             decision.update(method="column_descending", column=col)
             return descending_frame, decision
 
+        # Neither direction of this column clears the purse test.
+        #
+        # That is NOT a reason to discard the column. The purse test is
+        # a statement about prices; an explicit lot number is a
+        # statement about order, and the two fail independently. If the
+        # price column is corrupt -- duplicated sale prices, a mis-join,
+        # a wrong purse constant -- every ordering will overdraw, and
+        # falling through to "reverse the file and hope" throws away the
+        # one piece of hard evidence the file actually contains.
+        #
+        # So keep the column, take whichever direction overdraws less,
+        # and say plainly that the prices are the thing to fix.
+        best_frame, best_over, direction = (
+            (ascending_frame, over_asc, "ascending")
+            if over_asc <= over_desc
+            else (descending_frame, over_desc, "descending")
+        )
+
+        decision.update(
+            method=f"column_{direction}_unverified",
+            column=col,
+            warning=(
+                f"ordering taken from {col!r} ({direction}), but no "
+                f"ordering of this auction satisfies the purse "
+                f"constraint (best overdraft {best_over:.0f} against a "
+                f"purse of {max_purse}). The order is probably right and "
+                f"the PRICES are probably wrong -- check auctionPrice "
+                f"and the purse constant before trusting team_state."
+            ),
+        )
+
+        if verbose:
+            print(f"  auction order: {decision['method']} ({col!r})")
+            print(f"    WARNING: {decision['warning']}")
+
+        return best_frame, decision
+
     # ------------------------------------------------------------------
     # 2/3. Fall back to direction, decided by the purse test.
     # ------------------------------------------------------------------

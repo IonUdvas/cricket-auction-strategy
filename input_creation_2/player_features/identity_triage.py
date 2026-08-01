@@ -26,7 +26,33 @@ model most of the benefit from the first dozen rows you add to
 data/identity/cricinfo_resolution.csv.
 """
 
+import re
+
 import pandas as pd
+
+
+def _parse_price(value):
+    """
+    Lakh, from the auction file's own money format.
+
+    The rosters store "2.00 Cr" and "30.00 L" as strings, so a plain
+    pd.to_numeric returns NaN for every row and the cost ranking below
+    silently collapses to zero for all 93 players -- which is exactly
+    the ordering that makes this report worth reading. Mirrors
+    AuctionReplayEngine._parse_price.
+    """
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return float("nan")
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return float("nan")
+    match = re.match(r"([\d.]+)\s*(CR|CRORE|L|LAKH)?", text.upper())
+    if match is None:
+        return float("nan")
+    amount = float(match.group(1))
+    return amount * 100 if match.group(2) in ("CR", "CRORE") else amount
 
 
 def triage_identity(feature_context, rosters, verbose=True):
@@ -77,7 +103,7 @@ def triage_identity(feature_context, rosters, verbose=True):
             continue
 
         prices = (
-            pd.to_numeric(grp["auctionPrice"], errors="coerce")
+            grp["auctionPrice"].map(_parse_price)
             if "auctionPrice" in grp.columns
             else pd.Series(dtype="float64")
         )
@@ -221,7 +247,37 @@ def classify_no_t20_record(triage_frame, feature_context, verbose=True):
         print()
         print(out["status"].value_counts().to_string())
 
-        singles = out[(out["status"] == "residue_hit") & (out["n_candidates"] == 1)]
+        # Two unresolved playerIds proposing the SAME person is not a
+        # match, it is a collision: the residue is computed per
+        # playerId, so a squad with two unclaimed slots and two
+        # unresolved names offers each of them both. At most one can be
+        # right, and which one needs a human.
+        from collections import Counter
+
+        proposed = Counter(
+            c
+            for cands in out["candidates"]
+            for c in cands
+        )
+        contested = {c for c, k in proposed.items() if k > 1}
+
+        if contested:
+            clash = out[out["candidates"].apply(
+                lambda cs: any(c in contested for c in cs)
+            )]
+            print(
+                f"\n  {len(clash)} playerIds propose a candidate that "
+                f"another unresolved playerId also proposes -- at most "
+                f"one of each pair can be right:"
+            )
+            for r in clash.itertuples():
+                print(f"    {r.playerName:28s} id={r.playerId:<10} -> {r.candidates}")
+
+        singles = out[
+            (out["status"] == "residue_hit")
+            & (out["n_candidates"] == 1)
+            & (~out["candidates"].apply(lambda cs: any(c in contested for c in cs)))
+        ]
         if len(singles):
             print(
                 f"\n  {len(singles)} unresolved playerIds have exactly ONE "

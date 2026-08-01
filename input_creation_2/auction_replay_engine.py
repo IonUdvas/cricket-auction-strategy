@@ -25,6 +25,13 @@ class AuctionReplayEngine:
     STATUS_RETAINED = "RETAINED"
     STATUS_RTM = "RTM"
     STATUS_TRADED = "TRADED"
+    STATUS_DRAFTED = "DRAFTED"
+
+    # Acquisitions that happened before the hammer fell. All three move
+    # a team's purse and squad exactly like a sale, and none of them is
+    # a market-clearing valuation, so all three are applied to team
+    # state and then removed from the bidding pool.
+    PREAUCTION_STATUSES = (STATUS_RETAINED, STATUS_TRADED, STATUS_DRAFTED)
 
     ####################################################################
     # Team aliases
@@ -87,6 +94,7 @@ class AuctionReplayEngine:
             "buyer_absent_from_ladder": [],
             "unresolvable_buyer": [],
             "next_bid_backfilled": [],
+            "matched_at_top": [],
             "dropped_bad_interval": [],
             "sale_price_below_base": [],
             "sale_price_missing": [],
@@ -245,11 +253,27 @@ class AuctionReplayEngine:
             if not grp["BidAmount"].is_monotonic_increasing
         )
         
+        # TRADED and DRAFTED used to be absent here, so every traded or
+        # drafted player was discarded before the replay began -- and
+        # with them, the purse they cost. 49 players across seven
+        # seasons, including the entire 2022 GT/LSG draft (KL Rahul at
+        # 17 Cr, Hardik Pandya and Rashid Khan at 15 Cr each), Cameron
+        # Green's 17.5 Cr trade to RCB in 2024 and Sanju Samson's 18 Cr
+        # move to CSK in 2026.
+        #
+        # The rows themselves are no great loss: a trade fee and a draft
+        # pick are negotiated, not bid, so they are not valuations. The
+        # purse is the loss. GT began the 2022 auction 3800 lakh down
+        # and LSG 3020 lakh down -- 42% and 34% of the purse -- and the
+        # engine had both starting at the full 9000. Every team_state
+        # feature for those franchises was wrong for the whole auction.
         VALID_STATUSES = {
             self.STATUS_SOLD,
             self.STATUS_UNSOLD,
             self.STATUS_RETAINED,
             self.STATUS_RTM,
+            self.STATUS_TRADED,
+            self.STATUS_DRAFTED,
         }
 
         self.player_df = (
@@ -426,13 +450,12 @@ class AuctionReplayEngine:
     def _apply_preauction_events(self):
         """
         Apply all auction events that occurred before the first player
-        entered the auction.
-        Currently this consists of retained players.
+        entered the auction: retentions, trades and draft picks.
         """
-        retained = self.player_df[
-            self.player_df["auctionStatus"] == self.STATUS_RETAINED
+        preauction = self.player_df[
+            self.player_df["auctionStatus"].isin(self.PREAUCTION_STATUSES)
         ]
-        for _, player in retained.iterrows():
+        for _, player in preauction.iterrows():
             # A retention is economically identical to a sale: one
             # player leaves the pool, one team's purse/slot/role
             # counters move. Reuse _apply_sale so this can never
@@ -445,7 +468,9 @@ class AuctionReplayEngine:
 
         self.player_df = (
             self.player_df[
-                self.player_df["auctionStatus"] != self.STATUS_RETAINED
+                ~self.player_df["auctionStatus"].isin(
+                    self.PREAUCTION_STATUSES
+                )
             ]
             .reset_index(drop=True)
         )
@@ -618,11 +643,39 @@ class AuctionReplayEngine:
                 bids[-2] if len(bids) >= 2 else base_price
             )
     
-        # compute next_bid
-        bids = player_bid_df.reset_index(drop=True)    
-        for i in range(len(bids) - 1):    
-            team = bids.loc[i, "Team"]    
-            history[team]["next_bid"] = bids.loc[i + 1, "BidAmount"]
+        ############################################################
+        # next_bid = the first later bid STRICTLY GREATER than this
+        # team's own last bid, i.e. the amount it declined to match.
+        #
+        # This used to take literally the next row, which breaks on the
+        # tie-in the source records whenever a new team joins at the
+        # current standing amount: two consecutive rows carry the same
+        # BidAmount. On Rishabh Pant in 2025 that is
+        #
+        #     ... DC 20.75 Cr | LSG 20.75 Cr | LSG 27.00 Cr
+        #
+        # so DC's upper bound came out as DC's own 20.75 -- a
+        # zero-width interval, which then got discarded as unusable.
+        # DC was not outbid by 20.75; it was outbid by LSG's next
+        # advance to 27 Cr. Six such rows in 2025 alone, and they are
+        # top-of-market bids on the most expensive players in the file.
+        #
+        # Scanning forward for a strictly larger amount also makes the
+        # calculation independent of how many teams tie in at a level,
+        # which is the only thing that varied here.
+        ############################################################
+
+        bids = player_bid_df.reset_index(drop=True)
+
+        for i in range(len(bids)):
+            team = bids.loc[i, "Team"]
+            amount = bids.loc[i, "BidAmount"]
+
+            later = bids.loc[i + 1:, "BidAmount"]
+            above = later[later > amount]
+
+            if len(above):
+                history[team]["next_bid"] = above.iloc[0]
     
         return history
     
@@ -776,6 +829,7 @@ class AuctionReplayEngine:
             ####################################################
 
             upper = info["next_bid"]
+            lower = info["last_bid"]
 
             if pd.isna(upper):
                 upper = winning_bid
@@ -783,7 +837,46 @@ class AuctionReplayEngine:
                     (player["playerId"], player["playerName"], team)
                 )
 
-            lower = info["last_bid"]
+            ################################################
+            # Matched at the top, not outbid.
+            #
+            # Under RTM the bidding stops and the original team
+            # MATCHES the standing bid, so the top bidder's last
+            # bid equals the sale price. That leaves upper == lower
+            # and these rows were being discarded as degenerate --
+            # 19 of them in 2018, 14 in 2025, and they are the most
+            # informative rows in the file. Arshdeep Singh's 18 Cr
+            # in 2025 was one: SRH bid it, PBKS matched it, and
+            # SRH's row said only "unusable" instead of "SRH valued
+            # Arshdeep at 18 Cr or more".
+            #
+            # A team that was matched rather than outbid was never
+            # asked to go higher, so there is no upper bound on
+            # what it would have paid: right-censored, exactly like
+            # the winner and like the ladder-absent RTM case that
+            # `displaced` already covers.
+            ################################################
+
+            matched_at_top = (
+                pd.notna(lower)
+                and pd.notna(winning_bid)
+                and upper <= lower
+                and lower >= winning_bid - 1e-6
+            )
+
+            if matched_at_top:
+                summary[team].update({
+                    "previous_bid": info["previous_bid"],
+                    "last_bid": lower,
+                    "lower": lower,
+                    "upper": self._winner_upper_bound(lower),
+                    "winner": False,
+                    "observation_type": "right",
+                })
+                self.diagnostics["matched_at_top"].append(
+                    (player["playerId"], player["playerName"], team, lower)
+                )
+                continue
 
             # Still unusable -> record it as unknown rather than emit a
             # degenerate interval.  A team cannot have been outbid by a

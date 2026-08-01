@@ -512,10 +512,6 @@ def build_training_samples(
 
     training_df = outputs["training"]
 
-    # Kept on the frame so build_training_df can report what the replay
-    # had to recover from, without changing this function's signature.
-    training_df.attrs["engine_quality_report"] = engine.quality_report()
-
     auction_state_df = outputs["auction_state"]
 
     team_state_df = outputs["team_state"]
@@ -597,6 +593,17 @@ def build_training_samples(
     # The id column must not leak into the feature block: this used to filter
     # out only "playerName", leaving the raw Cricbuzz playerId to be cast to
     # float32 and fed to the model as a numeric feature.
+    # Set AFTER the merge, not before. training_df.merge() returns a new
+    # frame and does not carry .attrs across, so an assignment made
+    # straight off engine.replay() is silently discarded here -- which
+    # is what happened to this one, leaving verify_year with
+    # engine_report=None and every replay diagnostic
+    # (buyer_absent_from_ladder, next_bid_backfilled,
+    # dropped_bad_interval, bid_order_source, auction order method)
+    # quietly unreported. Same trap the concat guard in
+    # build_training_df already exists to catch.
+    training_df.attrs["engine_quality_report"] = engine.quality_report()
+
     training_df.attrs["player_feature_columns"] = (
         PlayerFeatureContext.feature_column_names(player_features)
     )

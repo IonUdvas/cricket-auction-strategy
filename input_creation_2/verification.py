@@ -125,13 +125,26 @@ def verify_year(year, training_df, engine_report=None, verbose=True):
     note("error" if bad_bounds else "ok", "unusable intervals", bad_bounds)
 
     if len(known):
+        # A genuine bid increment at the top of the market is narrow in
+        # log terms: 25 lakh on top of 2500 is a log-width of 0.010. So
+        # 0.01 flags real rows, and only widths an order of magnitude
+        # below that indicate a fabricated interval.
         widths = np.log(known["upper"] / known["lower"])
-        razor = int((widths < 1e-2).sum())
+
+        razor = int((widths < 1e-3).sum())
         note(
             "error" if razor else "ok",
-            "near-zero-width intervals",
+            "fabricated-width intervals",
             razor,
-            "log-width < 0.01; these dominate the NLL",
+            "log-width < 0.001; no real bid increment is this small",
+        )
+
+        tight = int(((widths >= 1e-3) & (widths < 2e-2)).sum())
+        note(
+            "info",
+            "tight but plausible intervals",
+            tight,
+            "log-width < 0.02; expected at the top of the market",
         )
 
     # ------------------------------------------------------------------
@@ -207,11 +220,54 @@ def verify_year(year, training_df, engine_report=None, verbose=True):
             )
 
     if engine_report is not None:
+
+        # Counts should be zero; the order fields are descriptive
+        # strings whose severity depends on which value they took.
+        clean_values = {
+            0,
+            "recorded",
+            "column_ascending",
+            "column_descending",
+            "column_ascending_unverified",
+            "column_descending_unverified",
+            "reversed_file_order",
+            None,
+        }
+
         for key, value in engine_report.items():
-            severity = (
-                "ok"
-                if value in (0, "recorded")
-                else ("warn" if key == "bid_order_source" else "error")
+
+            if key == "auction_order_warning":
+                note("warn" if value else "ok", "engine: order warning",
+                     1 if value else 0, value or "")
+                continue
+
+            if key == "auction_order_method":
+                note(
+                    "ok"
+                    if value
+                    and value.startswith("column")
+                    and not value.endswith("_unverified")
+                    else "warn",
+                    "engine: auction order",
+                    value,
+                    "inferred from the purse test rather than a column"
+                    if value and not value.startswith("column")
+                    else (
+                        "column used, but no ordering clears the purse "
+                        "test -- suspect the prices, not the order"
+                        if value and value.endswith("_unverified")
+                        else ""
+                    ),
+                )
+                continue
+
+            if key == "matched_at_top":
+                note("info", "engine: RTM top bidders right-censored",
+                     value, "matched rather than outbid; recovered")
+                continue
+
+            severity = "ok" if value in clean_values else (
+                "warn" if isinstance(value, str) else "error"
             )
             note(severity, f"engine: {key}", value)
 
