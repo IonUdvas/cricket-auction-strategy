@@ -148,6 +148,59 @@ def name_signatures(name):
     return {sig for sig in sigs if sig[0]}
 
 
+def given_tokens(name):
+    """
+    The given-name tokens this name spells out in full, lowercased.
+
+    Empty when the source abbreviates ("JP Inglis", "KL Rahul", "SA Yadav").
+    Non-empty when it does not ("Josh Inglis", "Raghu Sharma").
+
+    The distinction matters because the signature and initials tiers reduce a
+    given name to its first letter, and two *spelled-out* given names that
+    differ are strong evidence of two different people -- "Josh" and "Jack"
+    both reduce to "j", and the auction's Josh Inglis (8.6 crore, LSG) was
+    resolving to a Jack Inglis with a unique signature hit, silently and with
+    no ambiguity flagged.  Initial-level matching is legitimate only when one
+    side actually abbreviated.
+    """
+    toks = _tokens(name)
+    return {t.lower() for t in toks[:-1]
+            if len(t) > 1 and not (t.isupper() and len(t) <= 4)
+            and t.lower() not in _PARTICLES}
+
+
+def _within_one_edit(a, b):
+    """
+    True if `a` and `b` differ by at most one insertion, deletion or
+    substitution.  Only consulted for tokens of 5+ characters, where a
+    one-character gap is far more likely to be a transliteration variant than
+    two different names.
+
+    This is the difference between "Liton"/"Litton", "Anirudha"/"Aniruddha" and
+    "Subhransu"/"Subhranshu" -- all one man written two ways -- and
+    "Mukul"/"Mukesh" or "Josh"/"Jack", which are two men and stay blocked.
+    """
+    if a == b:
+        return True
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) > len(b):
+        a, b = b, a
+    i = j = edits = 0
+    while i < len(a) and j < len(b):
+        if a[i] == b[j]:
+            i += 1
+            j += 1
+            continue
+        edits += 1
+        if edits > 1:
+            return False
+        if len(a) == len(b):
+            i += 1
+        j += 1
+    return edits + (len(b) - j) + (len(a) - i) <= 1
+
+
 def _is_subsequence(short, long):
     """Every letter of `short`, in order, appears in `long`."""
     it = iter(long)
@@ -181,6 +234,7 @@ class PlayerIdentityResolver:
         self._by_norm = {}
         self._by_sig = {}
         self._by_surname = {}
+        self._given = {}
 
         for row in people.itertuples(index=False):
             for variant in str(row.name_variants).split("|"):
@@ -189,6 +243,9 @@ class PlayerIdentityResolver:
                     continue
                 self._by_variant.setdefault(variant, set()).add(row.person_id)
                 self._by_norm.setdefault(normalize_name(variant), set()).add(row.person_id)
+                self._given.setdefault(row.person_id, set()).update(
+                    given_tokens(variant)
+                )
                 for sig in name_signatures(variant):
                     self._by_sig.setdefault(sig, set()).add(row.person_id)
                     self._by_surname.setdefault(sig[0], set()).add(
@@ -209,6 +266,7 @@ class PlayerIdentityResolver:
         self.unresolved = []
         self.ambiguous = []
         self.conflicts = []
+        self.collisions = []
 
         # ---- search-populated resolution cache ---------------------------
         # cricinfo_id -> person_id, straight off the register.
@@ -241,17 +299,42 @@ class PlayerIdentityResolver:
     # candidate tiers
     # ------------------------------------------------------------------
 
+    def _given_name_allows(self, wanted, person_id):
+        """
+        False only when both sides spell a given name out in full and they
+        disagree.  If either side abbreviates there is nothing to compare and
+        the initials tiers are free to do their job.
+        """
+        if not wanted:
+            return True
+        theirs = self._given.get(person_id)
+        if not theirs:
+            return True
+        if wanted & theirs:
+            return True
+        return any(_within_one_edit(w, t)
+                   for w in wanted if len(w) >= 5
+                   for t in theirs if len(t) >= 5)
+
     def _surname_matches(self, player_name):
         """(signature hits, subsequence hits, prefix hits) over every reading
-        of `player_name` -- see `name_signatures` on why there can be two."""
+        of `player_name` -- see `name_signatures` on why there can be two.
+
+        All three are filtered by `_given_name_allows`: these tiers match on
+        first letters, and a first letter is not enough to identify a man when
+        both sources wrote his given name out in full and wrote different ones.
+        """
+        wanted = given_tokens(player_name)
+        ok = lambda pid_: self._given_name_allows(wanted, pid_)
         exact_sig, subset, prefix = set(), set(), set()
         for surname, initials in name_signatures(player_name):
-            exact_sig |= self._by_sig.get((surname, initials), set())
+            exact_sig |= {p for p in self._by_sig.get((surname, initials), set())
+                          if ok(p)}
             if not initials:
                 continue
             pool = self._by_surname.get(surname, ())
-            subset |= {p for c, p in pool if _is_subsequence(initials, c)}
-            prefix |= {p for c, p in pool if c.startswith(initials)}
+            subset |= {p for c, p in pool if _is_subsequence(initials, c) and ok(p)}
+            prefix |= {p for c, p in pool if c.startswith(initials) and ok(p)}
         return exact_sig, subset, prefix
 
     def _tiers(self, player_name):
@@ -452,6 +535,22 @@ class PlayerIdentityResolver:
 
         out["person_id"] = [decisions[p][0] for p in out[id_column]]
         out["match_method"] = [decisions[p][1] for p in out[id_column]]
+
+        # Two auction playerIds landing on one Cricsheet person is the failure
+        # mode the per-playerId design cannot catch on its own: each decision
+        # is individually confident and only the pair is wrong.  Sometimes it
+        # is genuine (the auction really does carry two records for one man);
+        # sometimes it is Chris Green being handed Cameron Green's career.
+        # Either way it needs a human, so it is reported rather than guessed.
+        claimed = {}
+        for pid_, (person, _) in decisions.items():
+            if person is not None:
+                claimed.setdefault(person, []).append(pid_)
+        names = dict(zip(out[id_column], out[name_column]))
+        self.collisions = [
+            (person, sorted((p, names.get(p)) for p in pids))
+            for person, pids in claimed.items() if len(pids) > 1
+        ]
         return out
 
     def report(self, roster_resolved=None):
@@ -467,6 +566,11 @@ class PlayerIdentityResolver:
             lines.append(f"resolved {matched}/{total} rows ({matched / total:.1%}), "
                          f"{id_hits}/{n_ids} playerIds ({id_hits / n_ids:.1%})")
             lines.append(f"  by method: {counts}")
+        if self.collisions:
+            lines.append(f"  collisions ({len(self.collisions)}) -- one "
+                         f"Cricsheet person claimed by several playerIds:")
+            for person, pids in self.collisions[:25]:
+                lines.append(f"    {person} <- {pids}")
         if self.conflicts:
             lines.append(f"  spelling conflicts ({len(self.conflicts)}):")
             for pid, name, hits in self.conflicts[:25]:

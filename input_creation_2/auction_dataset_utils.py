@@ -143,30 +143,6 @@ class PlayerFeatureContext:
         features = pd.DataFrame(rows)
         features.insert(0, "playerId", roster["playerId"].to_numpy())
 
-        ############################################################
-        # identity_unresolved
-        #
-        # An unresolved playerId and a genuine uncapped debutant both
-        # produce an all-zero career with has_history = 0. They are
-        # not the same statement. One says "this player has never
-        # played a T20"; the other says "we could not look this player
-        # up", and that second group contains capped internationals
-        # whose real careers are simply missing.
-        #
-        # Without this flag the model has to average over both, which
-        # drags every genuine debutant's valuation up toward the
-        # unlookuppable veterans and every veteran's down. With it, the
-        # network can learn a separate offset for "unknown identity" --
-        # the same reason PlayerFeatureBuilder already emits a
-        # *_is_missing companion for every metric that can be
-        # undefined.
-        ############################################################
-
-        features["identity_unresolved"] = [
-            0.0 if pid_ in self.person_by_player else 1.0
-            for pid_ in roster["playerId"]
-        ]
-
         assert len(features) == len(roster), "feature table lost or gained rows"
         assert features["playerId"].is_unique, "duplicate playerId in features"
         return features
@@ -177,29 +153,11 @@ class PlayerFeatureContext:
         return [c for c in features.columns if c not in ("playerId", "playerName")]
 
 class LabelEncoder:
-    """
-    Label encoder with a reserved unknown bucket at index 0.
-
-    The unknown bucket exists because the team vocabulary is not
-    stable across auctions: franchises enter (GT and LSG from 2022),
-    leave (RPS, GL), and get renamed (DD -> DC, KXIP -> PBKS, only two
-    of which TEAM_ALIASES knows about). Without a bucket, `transform`
-    mapped an unseen team to NaN and then died in `.astype(int)`, at
-    the point of tensor construction, with no mention of which label
-    was at fault.
-
-    Index 0 is deliberately never a real team, so the embedding row a
-    surprise team lands on is a row that means "team I was not trained
-    on" rather than whichever franchise happened to sort first.
-    """
-
-    UNKNOWN = "<UNK>"
 
     def __init__(self):
 
         self.label_to_idx = {}
         self.idx_to_label = {}
-        self.unseen = {}
 
     def fit(self, values):
 
@@ -209,12 +167,12 @@ class LabelEncoder:
             .unique()
         )
 
-        values = [v for v in sorted(values) if v != self.UNKNOWN]
+        values = sorted(values)
 
-        self.label_to_idx = {self.UNKNOWN: 0}
-
-        for idx, label in enumerate(values, start=1):
-            self.label_to_idx[label] = idx
+        self.label_to_idx = {
+            label: idx
+            for idx, label in enumerate(values)
+        }
 
         self.idx_to_label = {
             idx: label
@@ -225,17 +183,11 @@ class LabelEncoder:
 
     def transform(self, values):
 
-        series = pd.Series(values)
-
-        mapped = series.map(self.label_to_idx)
-
-        missing = mapped.isna()
-
-        if missing.any():
-            for label, count in series[missing].value_counts().items():
-                self.unseen[label] = self.unseen.get(label, 0) + int(count)
-
-        return mapped.fillna(0).astype(int)
+        return (
+            pd.Series(values)
+            .map(self.label_to_idx)
+            .astype(int)
+        )
 
     def fit_transform(self, values):
 
@@ -593,17 +545,6 @@ def build_training_samples(
     # The id column must not leak into the feature block: this used to filter
     # out only "playerName", leaving the raw Cricbuzz playerId to be cast to
     # float32 and fed to the model as a numeric feature.
-    # Set AFTER the merge, not before. training_df.merge() returns a new
-    # frame and does not carry .attrs across, so an assignment made
-    # straight off engine.replay() is silently discarded here -- which
-    # is what happened to this one, leaving verify_year with
-    # engine_report=None and every replay diagnostic
-    # (buyer_absent_from_ladder, next_bid_backfilled,
-    # dropped_bad_interval, bid_order_source, auction order method)
-    # quietly unreported. Same trap the concat guard in
-    # build_training_df already exists to catch.
-    training_df.attrs["engine_quality_report"] = engine.quality_report()
-
     training_df.attrs["player_feature_columns"] = (
         PlayerFeatureContext.feature_column_names(player_features)
     )
@@ -614,17 +555,10 @@ def build_training_samples(
         if c not in metadata_columns
     ]
 
-    # Belt-and-braces against the two groups overlapping again. The
-    # engine no longer spreads auction_state into team_state_row, but
-    # this is the place where an overlap would silently double a
-    # feature's weight in AuctionAdjustmentNetwork, so subtract
-    # explicitly rather than trusting the row builder.
-    _auction_cols = set(training_df.attrs["auction_state_columns"])
-
     training_df.attrs["team_state_columns"] = [
         c
         for c in team_state_df.columns
-        if c not in metadata_columns and c not in _auction_cols
+        if c not in metadata_columns
     ]
 
     training_df.attrs["bid_summary_columns"] = [

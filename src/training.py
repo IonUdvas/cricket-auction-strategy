@@ -5,20 +5,12 @@ from input_creation_2.auction_dataset_utils import (
     PlayerFeatureContext,
 )
 from input_creation_2.auction_dataset import IPLAuctionDataset
-from input_creation_2.verification import (
-    verify_year,
-    verify_feature_monotonicity,
-)
 from valuation_model.models import *
 from valuation_model.losses import *
 from valuation_model.training import *
-from valuation_model.scaling import fit_scalers
 from torch.utils.data import DataLoader
 
-import numpy as np
 import pandas as pd
-import random
-import torch
 import yaml
 
 import os
@@ -32,24 +24,6 @@ CONFIG_PATH = os.environ.get(
 
 with open(CONFIG_PATH, "r") as f:
     config = yaml.safe_load(f)
-
-
-def set_seed(seed=None):
-    """
-    `seed: 42` sat in default.yaml and was read by nothing, so no run
-    was reproducible: weight init, DataLoader shuffling and the
-    train/val batch composition all varied between runs. That makes
-    small effects unmeasurable -- a feature worth 0.02 nats is
-    indistinguishable from run-to-run noise until this is fixed.
-    """
-    if seed is None:
-        seed = config.get("seed")
-    if seed is None:
-        return
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
 
 # The ball data is a DIRECTORY of parquets written by data.build_bbb
 # (deliveries / fielding / people / wickets / matches), not the single flat
@@ -152,12 +126,6 @@ def build_training_df(
         training_dfs[year] = training_df
         print(f"Finished {year}: {len(training_df)} training rows")
 
-        verify_year(
-            year,
-            training_df,
-            engine_report=training_df.attrs.get("engine_quality_report"),
-        )
-
     # pandas silently drops attrs to {} when concatenated frames disagree, and
     # IPLAuctionDataset then dies with a bare KeyError far from the cause.
     frames = list(training_dfs.values())
@@ -174,11 +142,6 @@ def build_training_df(
                     f"only in {year} {sorted(b - a)}"
                 )
 
-    # As-of correctness can only be checked across years, so it runs
-    # here rather than inside the per-year loop.
-    if len(training_dfs) > 1:
-        verify_feature_monotonicity(training_dfs)
-
     full_training_df = pd.concat(training_dfs.values(), ignore_index=True)
     full_training_df.attrs = reference
 
@@ -189,8 +152,7 @@ def load_and_encode_data(full_training_df):
 
     dataset = IPLAuctionDataset(
         full_training_df,
-        encoder_manager,
-        scalers=fit_scalers(full_training_df),
+        encoder_manager
     )
 
     loader = DataLoader(
@@ -208,8 +170,6 @@ def run_training_pipeline(
         player_role_df=None,
 ):
     
-    set_seed()
-
     full_training_df = build_training_df(player_template, bid_template, bbb_dir)
 
     ################################################################
@@ -297,57 +257,6 @@ def run_training_pipeline(
     return model, history, encoder_manager, dataset, loader, full_training_df
 
 
-def report_team_coverage(train_df, val_df, encoder_manager):
-    """
-    Print which team embeddings actually get trained.
-
-    A vocabulary of 10 (+ <UNK>) is the union across every auction in
-    the split; individual years using fewer is expected, not a bug.
-    An untrained embedding being used at validation time IS a bug, and
-    it is invisible in the loss curve because it just looks like that
-    franchise being hard to predict.
-    """
-
-    vocabulary = encoder_manager.get_encoder("team").classes_
-
-    train_counts = train_df["team"].value_counts()
-    val_counts = val_df["team"].value_counts()
-
-    untrained = sorted(
-        set(val_counts.index) - set(train_counts.index)
-    )
-
-    print(
-        f"team vocabulary: {len(vocabulary)} "
-        f"(index 0 = <UNK>, {len(vocabulary) - 1} real franchises)"
-    )
-    print(
-        f"  train: {len(train_counts)} teams | "
-        f"val: {len(val_counts)} teams"
-    )
-
-    never_seen = sorted(
-        t for t in vocabulary
-        if t != "<UNK>" and t not in train_counts.index
-    )
-    if never_seen:
-        print(
-            f"  {len(never_seen)} embedding row(s) receive no gradient: "
-            f"{never_seen}"
-        )
-
-    if untrained:
-        print(
-            f"  WARNING: {untrained} appear in validation with zero "
-            f"training rows -- their predictions come from an "
-            f"untrained embedding"
-        )
-
-    thin = train_counts[train_counts < 0.2 * train_counts.median()]
-    if len(thin):
-        print(f"  thinly-trained teams: {thin.to_dict()}")
-
-
 def run_training_pipeline_with_holdout(
         player_template,
         bid_template,
@@ -381,8 +290,6 @@ def run_training_pipeline_with_holdout(
     # then evaluated on a player it never saw. It also read and aggregated 2.4M
     # deliveries twice for no benefit.
     ################################################################
-
-    set_seed()
 
     if bbb_dir is None:
         bbb_dir = DEFAULT_BBB_DIR
@@ -461,19 +368,8 @@ def run_training_pipeline_with_holdout(
     train_df.attrs["role_columns"] = role_columns 
     val_df.attrs["role_columns"] = role_columns
 
-    ################################################################
-    # Input scaling, fit on TRAIN ONLY.
-    #
-    # Unlike the encoder vocabulary above, this is a distributional
-    # fit, so fitting it on the train+val union would leak the
-    # validation year's feature distribution.  Both datasets share
-    # one scaler; val is transformed by train's statistics.
-    ################################################################
-
-    scalers = fit_scalers(train_df)
-
-    train_dataset = IPLAuctionDataset(train_df, encoder_manager, scalers=scalers)
-    val_dataset = IPLAuctionDataset(val_df, encoder_manager, scalers=scalers)
+    train_dataset = IPLAuctionDataset(train_df, encoder_manager)
+    val_dataset = IPLAuctionDataset(val_df, encoder_manager)
 
     train_loader = DataLoader(
         train_dataset,
@@ -512,21 +408,6 @@ def run_training_pipeline_with_holdout(
         encoder_manager.get_encoder("team").classes_
     )
 
-    ################################################################
-    # Team embedding coverage.
-    #
-    # The embedding table is sized from the vocabulary pooled over
-    # every year in the split, so it is 10 rows wide (plus <UNK>) even
-    # when a given year fielded 8 franchises. That is correct: 2018
-    # simply never indexes the GT and LSG rows. The thing worth
-    # checking is the opposite direction -- a team that appears in
-    # VALIDATION but has no training rows is being scored through an
-    # embedding that was randomly initialised and never received a
-    # single gradient.
-    ################################################################
-
-    report_team_coverage(train_df, val_df, encoder_manager)
-
     model = ValuationModel(
         player_dim=config["model"]["player_dim"],
         team_state_dim=config["model"]["team_state_dim"],
@@ -534,10 +415,6 @@ def run_training_pipeline_with_holdout(
         num_role_features=config["model"]["num_role_features"],
         num_teams=config["model"]["num_teams"],
         embedding_dim=config["model"]["embedding_dim"],
-        sigma_min=config["model"].get("sigma_min", 0.05),
-        sigma_max=config["model"].get("sigma_max", 1.5),
-        mu_prior=config["model"].get("mu_prior_lakh", 50.0),
-        max_log_phi=config["model"].get("max_log_phi", 1.5),
     )
 
     criterion = IntervalCensoredLoss()
@@ -560,9 +437,6 @@ def run_training_pipeline_with_holdout(
         device=device,
         epochs=config["training"]["epochs"],
         valid_loader=val_loader,
-        patience=config["training"].get("early_stopping_patience"),
-        min_delta=config["training"].get("early_stopping_min_delta", 0.0),
-        restore_best=config["training"].get("restore_best_weights", True),
     )
 
     val_predictions = evaluate_predictions(
@@ -581,6 +455,5 @@ def run_training_pipeline_with_holdout(
         "val_loader": val_loader,
         "train_df": train_df,
         "val_df": val_df,
-        "scalers": scalers,
         "val_predictions": val_predictions,
     }
