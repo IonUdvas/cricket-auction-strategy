@@ -172,8 +172,25 @@ def verify_year(year, training_df, engine_report=None, verbose=True):
 
     player_cols = training_df.attrs.get("player_feature_columns", [])
 
-    if player_cols:
-        block = training_df[player_cols]
+    ##################################################################
+    # "No feature row at all" means the ball-by-ball career came back
+    # empty, i.e. identity resolution missed the player. It has to be
+    # measured on the career columns ONLY.
+    #
+    # add_player_context_features now puts ctx_basePrice /
+    # ctx_cappedStatus / ctx_isPlayerOverseas in this same block, and
+    # those come off the auction row, so they are populated for every
+    # player including the unresolved ones. Left as-is,
+    # `block.isna().all(axis=1)` can no longer be True for ANY row and
+    # this check silently reports 0 unresolved players forever --
+    # which is the same number it reports when identity resolution is
+    # perfect.
+    ##################################################################
+
+    career_cols = [c for c in player_cols if not c.startswith("ctx_")]
+
+    if career_cols:
+        block = training_df[career_cols]
         all_missing = block.isna().all(axis=1)
 
         unresolved = training_df.loc[all_missing, "playerId"].nunique()

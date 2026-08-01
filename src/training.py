@@ -3,6 +3,7 @@ from input_creation_2.auction_dataset_utils import (
     build_encoders,
     build_role_table,
     PlayerFeatureContext,
+    DEFAULT_PLAYER_CONTEXT_COLUMNS,
 )
 from input_creation_2.auction_dataset import IPLAuctionDataset
 from valuation_model.models import *
@@ -168,6 +169,7 @@ def build_training_df(
         overrides=None,
         resolution=None,
         feature_context=None,
+        player_context_columns=None,
 ):
     """
     years      : iterable of int, optional. Defaults to all of AUCTION_DATES.
@@ -185,6 +187,16 @@ def build_training_df(
                  train/val split shares one identity map; resolving each split
                  separately lets one playerId become two different cricketers,
                  which is the whole thing PlayerFeatureContext exists to stop.
+    player_context_columns : iterable of str, or None.
+                 Pre-auction facts on the replay-engine row to promote into the
+                 player feature block -- basePrice, cappedStatus,
+                 isPlayerOverseas by default. None reads
+                 data.player_context_columns from the config; an explicit empty
+                 list turns the promotion off entirely, which is the ablation
+                 the basePrice caveat in auction_dataset_utils calls for.
+                 build_training_samples has taken this argument since the
+                 promotion was added and nothing ever passed it, so the
+                 "behind a config flag" in that comment was not true.
     """
     if bbb_dir is None:
         bbb_dir = DEFAULT_BBB_DIR
@@ -214,6 +226,12 @@ def build_training_df(
         }
         feature_context.register_rosters(rosters)
 
+    if player_context_columns is None:
+        player_context_columns = (config.get("data", {}) or {}).get(
+            "player_context_columns",
+            list(DEFAULT_PLAYER_CONTEXT_COLUMNS),
+        )
+
     training_dfs = {}
     for year, auction_date in selected_years.items():
         print(f"Building {year}...")
@@ -223,6 +241,7 @@ def build_training_df(
             feature_context,
             auction_date,
             auction_max_purse=AUCTION_MAX_PURSES[year],
+            player_context_columns=player_context_columns,
         )
         training_dfs[year] = training_df
         print(f"Finished {year}: {len(training_df)} training rows")
@@ -429,6 +448,34 @@ def run_training_pipeline_with_holdout(
         player_template, bid_template, bbb_dir, years=val_years,
         feature_context=feature_context,
     )
+
+    ################################################################
+    # Train and val are two separate build_training_df calls, and
+    # build_training_df only checks the attrs contract ACROSS YEARS
+    # WITHIN its own call -- nothing compared the two splits.
+    #
+    # It matters now that the player block carries columns derived
+    # from the auction row rather than only from the ball data: a
+    # column whose presence depends on the data (an is_missing flag
+    # emitted only when something was missing, which is what
+    # add_player_context_features used to do) can differ between the
+    # splits. With scalers on, the divergence is invisible --
+    # BlockScaler transforms the columns it was fit on, so the val
+    # frame's extra column is silently dropped and the model trains
+    # on a val block that is not the val block. This check is cheap
+    # and turns that into a message.
+    ################################################################
+
+    for key in ("player_feature_columns", "team_state_columns",
+                "auction_state_columns"):
+        if train_df.attrs.get(key) != val_df.attrs.get(key):
+            a = set(train_df.attrs.get(key, []))
+            b = set(val_df.attrs.get(key, []))
+            raise ValueError(
+                f"train and val disagree on attrs[{key!r}]: "
+                f"only in train {sorted(a - b)}, only in val {sorted(b - a)}. "
+                f"The two splits must present the same feature block."
+            )
 
     ################################################################
     # Fit encoders on the UNION of train + val categories.

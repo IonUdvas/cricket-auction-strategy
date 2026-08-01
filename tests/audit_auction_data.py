@@ -375,6 +375,31 @@ def audit_feature_blocks(training_df, report):
             sorted(leaked),
         )
 
+    ##################################################################
+    # basePrice is now IN the player block, deliberately, as
+    # ctx_basePrice -- and the rename means the BLOCKER check above
+    # does not see it. That is the intended behaviour (a base price is
+    # announced before the auction opens, so it is not hindsight), but
+    # it should be visible in the audit rather than absent from it,
+    # because of what it does to the labels: a 'left' row's interval
+    # is literally (0.01, basePrice), so on those rows the upper bound
+    # of the target is readable straight off an input column.
+    ##################################################################
+
+    promoted = sorted(c for c in player_cols if c.startswith("ctx_"))
+    report.add(
+        "all",
+        "warn" if "ctx_basePrice" in player_cols else "info",
+        "pre-auction context promoted into the player block",
+        len(promoted),
+        ", ".join(promoted)
+        + (
+            " -- ctx_basePrice bounds the label on every 'left' row"
+            if "ctx_basePrice" in player_cols
+            else ""
+        ),
+    )
+
     # A feature that is constant across the whole training set carries
     # no signal and, before scaling was added, could still dominate a
     # layer through sheer magnitude.
@@ -393,7 +418,12 @@ def audit_feature_blocks(training_df, report):
 
     # Rows whose entire player-feature block is missing: an unresolved
     # playerId that the left-merge never matched.
-    all_missing = int(training_df[sorted(player_cols)].isna().all(axis=1).sum())
+    #
+    # Career columns only. ctx_* come off the auction row rather than
+    # the ball data and are populated for unresolved players too, so
+    # including them makes this count structurally zero.
+    career_cols = sorted(c for c in player_cols if not c.startswith("ctx_"))
+    all_missing = int(training_df[career_cols].isna().all(axis=1).sum())
     report.add(
         "all",
         "warn",

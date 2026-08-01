@@ -36,6 +36,29 @@ data:
   # four career-total columns and treats the other ~85 as noise.
   scale_features: true
 
+  # Pre-auction facts the replay engine carries on every row that no
+  # feature block used to include, so they reached the model through
+  # no path at all. Promoted into the player block as ctx_basePrice /
+  # ctx_cappedStatus / ctx_isPlayerOverseas by
+  # add_player_context_features.
+  #
+  # basePrice is the one to think about. It is announced before the
+  # auction opens, so using it is not hindsight -- but a 'left' row's
+  # label interval is literally (0.01, basePrice), and 'left' is ~88%
+  # of rows, so on those rows the model can read the upper bound of
+  # its own target off an input. That is a shortcut rather than
+  # leakage, and it is a shortcut that can cost winner accuracy.
+  #
+  # Set this to [] to train without them; that is the ablation, and
+  # the winner-subset metrics from src.experiments (NOT
+  # overall_within_interval, which the 'left' rows dominate) are what
+  # decide it. Run it across >=5 seeds -- the seed spread here is as
+  # large as most config effects.
+  player_context_columns:
+    - basePrice
+    - cappedStatus
+    - isPlayerOverseas
+
   # DEFENSIVE, currently a no-op for you. With archetype_df_filtered
   # (the 24 boolean tags + player_id/country/capped_status/
   # is_overseas, the last three of which build_role_table already

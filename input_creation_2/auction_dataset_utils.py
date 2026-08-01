@@ -1,5 +1,6 @@
 import os
 
+import numpy as np
 import pandas as pd
 from input_creation_2.player_features.player_features import PlayerStatsAggregator, PlayerFeatureBuilder
 from input_creation_2.player_features.identity import PlayerIdentityResolver
@@ -577,6 +578,7 @@ def build_training_samples(
     feature_context,
     auction_date,
     auction_max_purse,
+    player_context_columns=None,
 ):
     """
     Build the complete training dataframe.
@@ -724,5 +726,228 @@ def build_training_samples(
         for c in bid_summary_df.columns
         if c not in metadata_columns
     ]
+
+    training_df = add_player_context_features(
+        training_df,
+        columns=player_context_columns,
+    )
+
+    return training_df
+
+
+####################################################################
+# Pre-auction facts about the player that the replay engine carries
+# on every row but that metadata_columns excluded from every feature
+# block, so they reached the model through no path at all.
+#
+# basePrice is the one that matters. It is the player's own
+# reservation price, announced before the auction opens, so it is
+# legitimately available at prediction time -- this is not
+# hindsight. On winners its Spearman correlation with the realised
+# auction price is 0.733, against roughly 0.68 for the whole trained
+# model, so it is the single strongest signal in the dataset and
+# nothing was reading it.
+#
+# cappedStatus and isPlayerOverseas fell through a gap: they are in
+# metadata_columns here, AND build_role_table drops the archetype
+# table's capped_status / is_overseas as "duplicates of what the
+# auction-replay engine already provides". Both sides deferred to
+# the other and neither supplied them.
+#
+# THE CAVEAT ON basePrice, because it is real:
+#
+#   For a 'left' row the label interval is literally
+#   (0.01, basePrice). Handing basePrice to the model as an input
+#   means that on 88% of training rows the upper bound of the target
+#   is readable straight off a feature. A model that just predicts
+#   slightly under basePrice for everyone scores well on those rows
+#   without learning anything about valuation.
+#
+#   That is a shortcut, not leakage -- the value is genuinely known
+#   pre-auction -- but a shortcut that costs winner accuracy is
+#   still a loss. So this is behind a config flag, defaults are set
+#   from a measured comparison rather than from taste, and the
+#   winner-subset metrics are what decide it. See the sweep in
+#   CHANGES.md.
+####################################################################
+
+DEFAULT_PLAYER_CONTEXT_COLUMNS = (
+    "basePrice",
+    "cappedStatus",
+    "isPlayerOverseas",
+)
+
+
+####################################################################
+# The boolean-ish spellings these columns actually arrive in.
+#
+# The auction API returns cappedStatus as CAPPED/UNCAPPED and
+# isPlayerOverseas as a JSON true/false, and the scraper writes both
+# straight to CSV. Neither is guaranteed to survive the round trip:
+# ONE blank cell anywhere in isPlayerOverseas makes pd.read_csv give
+# back dtype object holding True/False/nan, which is neither
+# is_bool_dtype nor is_numeric_dtype.
+#
+# That matters because the fallback branch below used to be a
+# hardcoded `== "CAPPED"` comparison applied to ANY non-numeric
+# column. So an object-dtype isPlayerOverseas became 0.0 for every
+# player: present in player_feature_columns, present in the tensor,
+# carrying nothing. Measured on a synthetic frame with a single blank
+# cell -- 1 distinct value, std 0.000, correlation with the raw
+# column undefined. Nothing else in the pipeline reports a constant
+# input, so it would have trained that way indefinitely.
+#
+# Mapping through an explicit vocabulary instead means an
+# unrecognised spelling becomes NaN -> flagged missing -> printed,
+# rather than silently becoming False.
+####################################################################
+
+CONTEXT_TRUE_TOKENS = {
+    "TRUE", "T", "YES", "Y", "1", "1.0",
+    "CAPPED",
+    "OVERSEAS",
+}
+
+CONTEXT_FALSE_TOKENS = {
+    "FALSE", "F", "NO", "N", "0", "0.0",
+    "UNCAPPED",
+    "INDIAN", "DOMESTIC",
+}
+
+
+def _context_to_binary(series):
+    """
+    Map a boolean / boolean-spelled-as-text column to 0.0 / 1.0 / NaN.
+
+    Everything non-numeric goes through here, real bool dtype
+    included -- True stringifies to "TRUE" and hits the vocabulary --
+    so there is one code path rather than one per dtype pandas might
+    have inferred from the CSV.
+
+    Returns (values, unmapped), where `unmapped` is the sorted list of
+    non-null tokens the vocabulary did not recognise.
+    """
+
+    text = series.astype("string").str.strip().str.upper()
+
+    values = pd.Series(np.nan, index=series.index, dtype=float)
+    values[text.isin(CONTEXT_TRUE_TOKENS)] = 1.0
+    values[text.isin(CONTEXT_FALSE_TOKENS)] = 0.0
+
+    known = text.isin(CONTEXT_TRUE_TOKENS) | text.isin(CONTEXT_FALSE_TOKENS)
+    unmapped = sorted(set(text[text.notna() & ~known].unique()))
+
+    return values, unmapped
+
+
+def add_player_context_features(training_df, columns=None, verbose=True):
+    """
+    Promote pre-auction player context into the player feature block.
+
+    Returns training_df with the numeric versions appended and
+    attrs["player_feature_columns"] extended. Columns already present
+    in the block, or absent from the frame, are skipped -- so calling
+    this twice is a no-op, and an older frame missing one of these
+    columns still builds.
+
+    Every promoted column gets a `ctx_<name>_is_missing` companion
+    UNCONDITIONALLY, even when nothing is missing.
+
+    The flag used to be emitted only `if values.isna().any()`, which
+    makes the WIDTH of player_feature_columns a function of the data.
+    train_years and val_years are built by two separate
+    build_training_df calls, so one unparseable base price in one
+    split and not the other gives the two frames different feature
+    blocks, and nothing compares them: with scalers on, the val
+    frame's extra column is silently dropped (BlockScaler transforms
+    the columns it was FIT on, i.e. train's); with scalers off it is
+    a shape mismatch inside the first nn.Linear. Within a single
+    split it is less dangerous only in that build_training_df's
+    cross-year attrs check turns it into a hard build failure.
+
+    A constant-zero flag costs three weights and makes the schema a
+    property of the code instead of a property of the data.
+    """
+
+    if columns is None:
+        columns = DEFAULT_PLAYER_CONTEXT_COLUMNS
+
+    columns = list(columns or [])
+
+    if not columns:
+        return training_df
+
+    existing = list(training_df.attrs.get("player_feature_columns", []))
+    added = []
+    summary = []
+
+    for column in columns:
+
+        if column not in training_df.columns:
+            summary.append(f"{column}: NOT IN FRAME, skipped")
+            continue
+
+        target = f"ctx_{column}"
+
+        if target in existing:
+            continue
+
+        series = training_df[column]
+        unmapped = []
+
+        if (
+            pd.api.types.is_numeric_dtype(series)
+            and not pd.api.types.is_bool_dtype(series)
+        ):
+            values = pd.to_numeric(series, errors="coerce").astype(float)
+        else:
+            values, unmapped = _context_to_binary(series)
+
+        training_df[target] = values
+        added.append(target)
+
+        ############################################################
+        # basePrice is never missing in the current data (0.000 NaN
+        # rate across all nine auctions), but a '--' base price for a
+        # traded or retained player is representable and parses to
+        # NaN. The flag follows the same *_is_missing convention the
+        # player feature block already uses, which BlockScaler and
+        # the dataset both fill to 1 rather than 0.
+        ############################################################
+
+        flag = f"{target}_is_missing"
+        training_df[flag] = values.isna().astype(float)
+        added.append(flag)
+
+        ############################################################
+        # A promoted column that came out constant reached the model
+        # in name only. Say so here, rather than leaving it to be
+        # inferred from a validation metric that did not move.
+        ############################################################
+
+        n_distinct = int(values.nunique(dropna=True))
+        n_missing = int(values.isna().sum())
+
+        line = (
+            f"{column} -> {target}: {n_distinct} distinct, "
+            f"{n_missing} missing "
+            f"({n_missing / max(len(values), 1):.1%})"
+        )
+
+        if unmapped:
+            line += f" | UNRECOGNISED {unmapped[:5]} -> NaN"
+
+        if n_distinct <= 1:
+            line += "  <-- CONSTANT, carries no signal"
+
+        summary.append(line)
+
+    if added:
+        training_df.attrs["player_feature_columns"] = existing + added
+
+    if verbose and summary:
+        print("  add_player_context_features:")
+        for line in summary:
+            print(f"    {line}")
 
     return training_df
