@@ -248,27 +248,52 @@ class IPLAuctionDataset(Dataset):
         # Targets
         ########################################################
 
-        self.lower_bid = torch.tensor(
+        ########################################################
+        # Bounds are NOT filled.
+        #
+        # fillna(0) here was the last line of defence that stopped a
+        # broken interval from ever being visible: a losing-bidder row
+        # whose upper bound the replay engine could not determine
+        # arrived as NaN, became 0, and the loss then clamped it up to
+        # lower + 1e-3 -- a label asserting that team's valuation to
+        # three decimal places, carrying a huge NLL, on a row that
+        # should not have existed at all.
+        #
+        # "unknown" rows are already gone by this point, so anything
+        # still NaN is a genuine defect upstream and should be fixed
+        # there, not papered over here.
+        ########################################################
 
-            self.training_df["lower"]
-            .fillna(0)
-            .to_numpy(dtype=np.float32),
-
-            dtype=torch.float32,
-        )
-
-        self.upper_bid = torch.tensor(
-
+        lower = self.training_df["lower"].to_numpy(dtype=np.float64)
+        upper = (
             self.training_df["upper"]
-            .fillna(0)
-            .replace(
-                np.inf,
-                np.finfo(np.float32).max,
-            )
-            .to_numpy(dtype=np.float32),
-
-            dtype=torch.float32,
+            .replace(np.inf, np.finfo(np.float32).max)
+            .to_numpy(dtype=np.float64)
         )
+
+        bad = (
+            ~np.isfinite(lower)
+            | ~np.isfinite(upper)
+            | (upper <= lower)
+            | (lower <= 0)
+        )
+
+        if bad.any():
+            offenders = (
+                self.training_df.loc[
+                    bad, ["playerName", "team", "observation_type"]
+                ]
+                .assign(lower=lower[bad], upper=upper[bad])
+                .head(10)
+            )
+            raise ValueError(
+                f"{int(bad.sum())} of {len(self.training_df)} rows have an "
+                f"unusable (lower, upper) interval. These used to be "
+                f"silently filled with 0. First offenders:\n{offenders}"
+            )
+
+        self.lower_bid = torch.tensor(lower, dtype=torch.float32)
+        self.upper_bid = torch.tensor(upper, dtype=torch.float32)
 
         ########################################################
         # Useful metadata

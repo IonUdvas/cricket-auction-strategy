@@ -72,6 +72,25 @@ class AuctionReplayEngine:
         }
 
         ############################################################
+        # Data-quality diagnostics
+        #
+        # Every one of these was previously a silent recovery that
+        # produced a plausible-looking training row.  They are counted
+        # instead, and surfaced by `quality_report()` so a bad roster
+        # or bid file shows up as a number rather than as a model that
+        # mysteriously underprices RTM players.
+        ############################################################
+
+        self.diagnostics = {
+            "buyer_absent_from_ladder": [],
+            "unresolvable_buyer": [],
+            "next_bid_backfilled": [],
+            "dropped_bad_interval": [],
+            "sale_price_below_base": [],
+            "sale_price_missing": [],
+        }
+
+        ############################################################
         # Normalize all inputs
         ############################################################
 
@@ -162,20 +181,66 @@ class AuctionReplayEngine:
         # Sort data
         # ---------------------------------------------------------
 
-        self.bid_df = (
-            self.bid_df
-            .sort_values(
-                ["playerId", "BidAmount"],
-                ascending=[True, True]
-            )
-            .reset_index(drop=True)
+        # ---------------------------------------------------------
+        # Bid ordering
+        #
+        # This used to sort on (playerId, BidAmount) and then OVERWRITE
+        # BidNumber with a cumcount, i.e. it threw away the recorded
+        # bid sequence and re-derived it from the amounts.  Two things
+        # went wrong with that.
+        #
+        # First, sort_values defaults to quicksort, which is unstable,
+        # so equal BidAmounts came out in arbitrary order and the
+        # last_bid / next_bid ladder for those teams was arbitrary too.
+        #
+        # Second and worse: when the recorded auctionPrice is not the
+        # maximum BidAmount in the ladder (RTM, an unlogged final bid,
+        # a rounding difference), re-sorting by amount puts a LOSING
+        # team last.  The last team in the ladder is the one team that
+        # never receives a next_bid, so that team ended up with
+        # upper = NaN -- which auction_dataset.py then filled with 0
+        # and the loss turned into a width-0.001 interval asserting
+        # that team's valuation to three decimal places.
+        #
+        # So: trust the recorded BidNumber when the file has one, and
+        # fall back to a STABLE sort on amount when it doesn't.
+        # ---------------------------------------------------------
+
+        has_recorded_order = (
+            "BidNumber" in self.bid_df.columns
+            and self.bid_df["BidNumber"].notna().all()
         )
-        
-        # Recreate BidNumber within each player
-        self.bid_df["BidNumber"] = (
-            self.bid_df
-            .groupby("playerId")
-            .cumcount() + 1
+
+        if has_recorded_order:
+            self.bid_df = (
+                self.bid_df
+                .sort_values(["playerId", "BidNumber"], kind="mergesort")
+                .reset_index(drop=True)
+            )
+        else:
+            self.bid_df = (
+                self.bid_df
+                .sort_values(["playerId", "BidAmount"], kind="mergesort")
+                .reset_index(drop=True)
+            )
+
+            self.bid_df["BidNumber"] = (
+                self.bid_df
+                .groupby("playerId")
+                .cumcount() + 1
+            )
+
+        self.bid_order_source = (
+            "recorded" if has_recorded_order else "reconstructed"
+        )
+
+        # A ladder whose amounts fall as BidNumber rises means the
+        # recorded order and the recorded amounts disagree; one of them
+        # is wrong and the interval bounds built from them will be too.
+        self.non_monotone_ladders = sorted(
+            pid
+            for pid, grp in self.bid_df.groupby("playerId")
+            if not grp["BidAmount"].is_monotonic_increasing
         )
         
         VALID_STATUSES = {
@@ -192,11 +257,12 @@ class AuctionReplayEngine:
             .reset_index(drop=True)
         )
 
-        self.bid_df = (
-            self.bid_df
-            .sort_values("BidNumber")
-            .reset_index(drop=True)
-        )
+        # NOTE: no global sort_values("BidNumber") here any more.
+        # BidNumber is a WITHIN-player counter, so sorting the whole
+        # frame by it interleaved every player's first bid, then every
+        # player's second bid, and so on.  Nothing downstream wanted
+        # that -- _build_bid_summary re-sorts per player anyway -- and
+        # it destroyed the only global ordering the frame had.
 
         valid_player_ids = set(self.player_df["playerId"])
 
@@ -546,6 +612,58 @@ class AuctionReplayEngine:
     
         return history
     
+    def _resolve_purchase(self, player, history):
+        """
+        Work out who actually paid for this player, and who (if anyone)
+        held the top bid but did not get him.
+
+        Returns (winning_team, winning_bid, displaced_team).
+
+        The old code took `playsForTeam` as the winner and left it at
+        that.  On a normal sale that is right.  On an RTM it is not:
+        the RTM-exercising team matches the top bid without ever
+        appearing in the bid ladder, so `playsForTeam` had
+        entered == False and fell into the "never entered" branch --
+        the team that just paid 9 crore was labelled as valuing the
+        player below his base price.  Meanwhile the genuine top bidder
+        was scored as an ordinary losing bidder, and being last in the
+        ladder had no next_bid, so his upper bound was NaN.
+
+        One player, two corrupted rows, no error raised.
+        """
+
+        declared = player["playsForTeam"]
+        winning_bid = player["auctionPrice"]
+
+        entered = [t for t in self.teams if history[t]["entered"]]
+
+        top_team = None
+        if entered:
+            top_team = max(entered, key=lambda t: history[t]["last_bid"])
+
+        # Normal sale: the buyer is in the ladder.
+        if declared in entered:
+            return declared, winning_bid, None
+
+        # RTM: the buyer never bid, but did pay.  The top bidder is
+        # displaced rather than outbid -- nobody ever went above him,
+        # so he is right-censored at his own last bid, not bounded
+        # above by a bid that does not exist.
+        if pd.notna(declared) and declared in self.teams:
+            self.diagnostics["buyer_absent_from_ladder"].append(
+                (player["playerId"], player["playerName"],
+                 player["auctionStatus"], declared, top_team)
+            )
+            return declared, winning_bid, top_team
+
+        # No usable buyer at all.  Emitting a winner row here would be
+        # inventing one, so the caller gets None and every bidding team
+        # is recorded as an interval against the sale price.
+        self.diagnostics["unresolvable_buyer"].append(
+            (player["playerId"], player["playerName"], declared)
+        )
+        return None, winning_bid, None
+
     def _summary_sold(
         self,
         player,
@@ -562,9 +680,11 @@ class AuctionReplayEngine:
             player["basePrice"]
         )
 
-        winner = player["playsForTeam"]
-        winning_bid = player["auctionPrice"]
         base_price = player["basePrice"]
+
+        winner, winning_bid, displaced = self._resolve_purchase(
+            player, history
+        )
 
         for team in self.teams:
             info = history[team]
@@ -574,6 +694,18 @@ class AuctionReplayEngine:
             ####################################################
 
             if not info["entered"]:
+
+                # The RTM buyer never bids, so "did not enter" must not
+                # be read as "did not want him".
+                if team == winner:
+                    summary[team].update({
+                        "lower": winning_bid,
+                        "upper": self._winner_upper_bound(winning_bid),
+                        "winner": True,
+                        "observation_type": "right",
+                    })
+                    continue
+
                 summary[team].update({
                     "lower": 0.01,
                     "upper": base_price,
@@ -589,32 +721,75 @@ class AuctionReplayEngine:
 
             if team == winner:
                 summary[team].update({
-                "previous_bid": info["previous_bid"],
-                "last_bid": info["last_bid"],            
-                "lower": winning_bid,            
-                "upper": self._winner_upper_bound(
-                    winning_bid
-                ),            
-                "winner": True,            
-                "observation_type": "right",
-            })
+                    "previous_bid": info["previous_bid"],
+                    "last_bid": info["last_bid"],
+                    "lower": winning_bid,
+                    "upper": self._winner_upper_bound(winning_bid),
+                    "winner": True,
+                    "observation_type": "right",
+                })
+
+                continue
+
+            ####################################################
+            # Top bidder displaced by RTM
+            #
+            # Never outbid, so there is no upper bound on what he was
+            # willing to pay -- same censoring shape as a winner, minus
+            # the winner flag.
+            ####################################################
+
+            if team == displaced:
+                summary[team].update({
+                    "previous_bid": info["previous_bid"],
+                    "last_bid": info["last_bid"],
+                    "lower": info["last_bid"],
+                    "upper": self._winner_upper_bound(info["last_bid"]),
+                    "winner": False,
+                    "observation_type": "right",
+                })
 
                 continue
 
             ####################################################
             # Losing bidder
+            #
+            # upper is the bid this team declined to match.  When the
+            # ladder does not record one (this team placed the final
+            # logged bid), the sale price is the correct bound: they
+            # were outbid by it.  Falling through with NaN is what
+            # produced the width-0.001 intervals.
             ####################################################
+
+            upper = info["next_bid"]
+
+            if pd.isna(upper):
+                upper = winning_bid
+                self.diagnostics["next_bid_backfilled"].append(
+                    (player["playerId"], player["playerName"], team)
+                )
+
+            lower = info["last_bid"]
+
+            # Still unusable -> record it as unknown rather than emit a
+            # degenerate interval.  A team cannot have been outbid by a
+            # number at or below its own bid.
+            if pd.isna(upper) or pd.isna(lower) or upper <= lower:
+                self.diagnostics["dropped_bad_interval"].append(
+                    (player["playerId"], player["playerName"], team,
+                     lower, upper)
+                )
+                continue
 
             summary[team].update({
                 "previous_bid": info["previous_bid"],
-                "last_bid": info["last_bid"],
-                "lower": info["last_bid"],
-                "upper": info["next_bid"],
+                "last_bid": lower,
+                "lower": lower,
+                "upper": upper,
                 "winner": False,
                 "observation_type": "interval",
             })
 
-        
         return summary
     
     def _summary_unsold(
@@ -769,10 +944,17 @@ class AuctionReplayEngine:
                 **auction_state,
             }
 
+            # auction_state is deliberately NOT spread in here.
+            # team_state_df.columns is what becomes
+            # attrs["team_state_columns"], so including auction_state
+            # made all eight auction-level features members of BOTH
+            # column groups -- and AuctionAdjustmentNetwork
+            # concatenates both groups, so auction_order,
+            # players_remaining and friends were fed to the model
+            # twice, at double weight against remaining_purse.
             team_state_row = {
-                **player_info,            
-                **auction_state,            
-                **team_state,            
+                **player_info,
+                **team_state,
             }
 
             bid_summary_row = {
@@ -826,7 +1008,28 @@ class AuctionReplayEngine:
         # Purse
         ############################################################
 
-        state["remaining_purse"] -= player["auctionPrice"]
+        price = player["auctionPrice"]
+
+        # Subtracting NaN turns a team's purse into NaN for the rest of
+        # the auction, and every team_state feature after that point is
+        # NaN too -- which the dataset then filled with 0, i.e. "this
+        # team has no money left", for every subsequent player.
+        if pd.isna(price):
+            self.diagnostics["sale_price_missing"].append(
+                (player["playerId"], player["playerName"], team)
+            )
+            price = 0.0
+
+        elif (
+            pd.notna(player["basePrice"])
+            and price < player["basePrice"]
+        ):
+            self.diagnostics["sale_price_below_base"].append(
+                (player["playerId"], player["playerName"],
+                 price, player["basePrice"])
+            )
+
+        state["remaining_purse"] -= price
 
         ############################################################
         # Squad
@@ -965,6 +1168,17 @@ class AuctionReplayEngine:
             )
 
         ############################################################
+        # Post-replay invariants
+        #
+        # A replay that ends with a team overdrawn, or over the squad
+        # or overseas limit, did not describe a real auction -- most
+        # often because the roster arrived in an order the engine
+        # guessed wrong (see the iloc[::-1] in _normalize_inputs).
+        ############################################################
+
+        self._check_final_state()
+
+        ############################################################
         # Convert to DataFrames
         ############################################################
 
@@ -972,3 +1186,45 @@ class AuctionReplayEngine:
             key: pd.DataFrame(value)
             for key, value in self.outputs.items()
         }
+
+    def _check_final_state(self):
+
+        self.final_state_violations = []
+
+        for team, state in self.team_state.items():
+
+            if state["remaining_purse"] < 0:
+                self.final_state_violations.append(
+                    (team, "negative purse", state["remaining_purse"])
+                )
+
+            if state["remaining_slots"] < 0:
+                self.final_state_violations.append(
+                    (team, "over squad size", state["remaining_slots"])
+                )
+
+            if state["overseas_bought"] > self.overseas_limit:
+                self.final_state_violations.append(
+                    (team, "over overseas limit", state["overseas_bought"])
+                )
+
+    def quality_report(self):
+        """
+        Everything the replay had to recover from, as counts.
+
+        Call this after replay().  A healthy auction is all zeros with
+        bid_order_source == "recorded".
+        """
+
+        report = {
+            key: len(value)
+            for key, value in self.diagnostics.items()
+        }
+
+        report["bid_order_source"] = self.bid_order_source
+        report["non_monotone_ladders"] = len(self.non_monotone_ladders)
+        report["final_state_violations"] = len(
+            getattr(self, "final_state_violations", [])
+        )
+
+        return report

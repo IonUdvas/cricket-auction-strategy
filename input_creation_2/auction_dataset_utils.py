@@ -153,11 +153,29 @@ class PlayerFeatureContext:
         return [c for c in features.columns if c not in ("playerId", "playerName")]
 
 class LabelEncoder:
+    """
+    Label encoder with a reserved unknown bucket at index 0.
+
+    The unknown bucket exists because the team vocabulary is not
+    stable across auctions: franchises enter (GT and LSG from 2022),
+    leave (RPS, GL), and get renamed (DD -> DC, KXIP -> PBKS, only two
+    of which TEAM_ALIASES knows about). Without a bucket, `transform`
+    mapped an unseen team to NaN and then died in `.astype(int)`, at
+    the point of tensor construction, with no mention of which label
+    was at fault.
+
+    Index 0 is deliberately never a real team, so the embedding row a
+    surprise team lands on is a row that means "team I was not trained
+    on" rather than whichever franchise happened to sort first.
+    """
+
+    UNKNOWN = "<UNK>"
 
     def __init__(self):
 
         self.label_to_idx = {}
         self.idx_to_label = {}
+        self.unseen = {}
 
     def fit(self, values):
 
@@ -167,12 +185,12 @@ class LabelEncoder:
             .unique()
         )
 
-        values = sorted(values)
+        values = [v for v in sorted(values) if v != self.UNKNOWN]
 
-        self.label_to_idx = {
-            label: idx
-            for idx, label in enumerate(values)
-        }
+        self.label_to_idx = {self.UNKNOWN: 0}
+
+        for idx, label in enumerate(values, start=1):
+            self.label_to_idx[label] = idx
 
         self.idx_to_label = {
             idx: label
@@ -183,11 +201,17 @@ class LabelEncoder:
 
     def transform(self, values):
 
-        return (
-            pd.Series(values)
-            .map(self.label_to_idx)
-            .astype(int)
-        )
+        series = pd.Series(values)
+
+        mapped = series.map(self.label_to_idx)
+
+        missing = mapped.isna()
+
+        if missing.any():
+            for label, count in series[missing].value_counts().items():
+                self.unseen[label] = self.unseen.get(label, 0) + int(count)
+
+        return mapped.fillna(0).astype(int)
 
     def fit_transform(self, values):
 
@@ -464,6 +488,10 @@ def build_training_samples(
 
     training_df = outputs["training"]
 
+    # Kept on the frame so build_training_df can report what the replay
+    # had to recover from, without changing this function's signature.
+    training_df.attrs["engine_quality_report"] = engine.quality_report()
+
     auction_state_df = outputs["auction_state"]
 
     team_state_df = outputs["team_state"]
@@ -555,10 +583,17 @@ def build_training_samples(
         if c not in metadata_columns
     ]
 
+    # Belt-and-braces against the two groups overlapping again. The
+    # engine no longer spreads auction_state into team_state_row, but
+    # this is the place where an overlap would silently double a
+    # feature's weight in AuctionAdjustmentNetwork, so subtract
+    # explicitly rather than trusting the row builder.
+    _auction_cols = set(training_df.attrs["auction_state_columns"])
+
     training_df.attrs["team_state_columns"] = [
         c
         for c in team_state_df.columns
-        if c not in metadata_columns
+        if c not in metadata_columns and c not in _auction_cols
     ]
 
     training_df.attrs["bid_summary_columns"] = [
