@@ -29,6 +29,16 @@ class PlayerFeatureContext:
     def __init__(self, bbb_dir, competitions=None, overrides=None,
                  resolution=None, use_squads=True, verbose=True):
         need = ("deliveries.parquet", "fielding.parquet", "people.parquet")
+        # The old pipeline took a path to one flat parquet, so this is the
+        # first thing anyone upgrading gets wrong.  Say so, instead of listing
+        # three files as "missing" from something that is not a directory.
+        if os.path.isfile(bbb_dir) or str(bbb_dir).endswith(".parquet"):
+            raise NotADirectoryError(
+                f"{bbb_dir} is a single parquet file. This pipeline now needs "
+                f"the DIRECTORY that data.build_bbb writes, holding "
+                f"{', '.join(need)}. Use the repo's data/bbb, or rebuild with "
+                f"`python -m data.build_bbb --out-dir data/bbb`."
+            )
         missing = [f for f in need if not os.path.exists(os.path.join(bbb_dir, f))]
         if missing:
             raise FileNotFoundError(
@@ -90,10 +100,20 @@ class PlayerFeatureContext:
             print(f"identity: {len(self.person_by_player)}/{n_ids} distinct "
                   f"playerIds resolved "
                   f"({len(self.person_by_player) / n_ids:.1%})")
+            # The resolver now settles each playerId once, pooling every
+            # spelling and every (season, franchise) it ever carried, so this
+            # loop is a belt-and-braces check that should never fire.  The
+            # disagreements it used to catch are caught one level down, in
+            # `resolver.conflicts`, where the evidence still exists.
             if self.identity_conflicts:
                 print(f"  {len(self.identity_conflicts)} playerIds resolved "
                       f"inconsistently across years and were left unresolved:")
                 for pid_, name, hits in self.identity_conflicts[:10]:
+                    print(f"    {name!r} (id {pid_}) -> {hits}")
+            if self.resolver.conflicts:
+                print(f"  {len(self.resolver.conflicts)} playerIds whose "
+                      f"spellings disagreed and were left unresolved:")
+                for pid_, name, hits in self.resolver.conflicts[:10]:
                     print(f"    {name!r} (id {pid_}) -> {hits}")
             if self.resolver.cache_misses:
                 print(f"  {len(self.resolver.cache_misses)} cached cricinfo ids "

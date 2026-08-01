@@ -25,6 +25,15 @@ CONFIG_PATH = os.environ.get(
 with open(CONFIG_PATH, "r") as f:
     config = yaml.safe_load(f)
 
+# The ball data is a DIRECTORY of parquets written by data.build_bbb
+# (deliveries / fielding / people / wickets / matches), not the single flat
+# parquet this pipeline used to take.  Defaulting to the repo's own copy means
+# a caller never has to know that.
+DEFAULT_BBB_DIR = os.path.join(REPO_ROOT, "data", "bbb")
+DEFAULT_RESOLUTION = os.path.join(
+    REPO_ROOT, "data", "identity", "cricinfo_resolution.csv"
+)
+
 AUCTION_DATES = {
     2018: "2018-01-27",
     2019: "2018-12-18",
@@ -52,17 +61,34 @@ AUCTION_MAX_PURSES = {
 def build_training_df(
         player_template,
         bid_template,
-        bbb_dir,
+        bbb_dir=None,
         years=None,
         competitions=None,
         overrides=None,
         resolution=None,
+        feature_context=None,
 ):
     """
-    years   : iterable of int, optional. Defaults to all of AUCTION_DATES.
-    bbb_dir : directory holding deliveries/fielding/people parquet, as written
-              by data.build_bbb. Was previously a path to one parquet file.
+    years      : iterable of int, optional. Defaults to all of AUCTION_DATES.
+    bbb_dir    : directory holding deliveries/fielding/people parquet, as
+                 written by data.build_bbb.  Was previously a path to one
+                 parquet file.  Defaults to the repo's own data/bbb.
+    resolution : the cricinfo identity cache.  Defaults to the repo's own
+                 data/identity/cricinfo_resolution.csv -- it used to default to
+                 None, which meant every hand-verified identity in that file was
+                 silently ignored by the training pipeline and players like
+                 Rohit Sharma trained with an empty career.
+    feature_context : an already-built PlayerFeatureContext with rosters
+                 already registered.  When given, identity is the caller's
+                 responsibility and is NOT re-resolved here.  This is how a
+                 train/val split shares one identity map; resolving each split
+                 separately lets one playerId become two different cricketers,
+                 which is the whole thing PlayerFeatureContext exists to stop.
     """
+    if bbb_dir is None:
+        bbb_dir = DEFAULT_BBB_DIR
+    if resolution is None and os.path.exists(DEFAULT_RESOLUTION):
+        resolution = DEFAULT_RESOLUTION
 
     selected_years = (
         AUCTION_DATES
@@ -70,21 +96,22 @@ def build_training_df(
         else {y: AUCTION_DATES[y] for y in years}
     )
 
-    # Built once, not once per year.
-    feature_context = PlayerFeatureContext(
-        bbb_dir,
-        competitions=competitions,
-        overrides=overrides,
-        resolution=resolution,
-    )
+    if feature_context is None:
+        # Built once, not once per year.
+        feature_context = PlayerFeatureContext(
+            bbb_dir,
+            competitions=competitions,
+            overrides=overrides,
+            resolution=resolution,
+        )
 
-    # Identity is resolved across ALL years at once, before any year is built,
-    # so one playerId cannot become two different cricketers.
-    rosters = {
-        year: pd.read_csv(player_template.format(year=year))
-        for year in selected_years
-    }
-    feature_context.register_rosters(rosters)
+        # Identity is resolved across ALL years at once, before any year is
+        # built, so one playerId cannot become two different cricketers.
+        rosters = {
+            year: pd.read_csv(player_template.format(year=year))
+            for year in selected_years
+        }
+        feature_context.register_rosters(rosters)
 
     training_dfs = {}
     for year, auction_date in selected_years.items():
@@ -139,11 +166,11 @@ def load_and_encode_data(full_training_df):
 def run_training_pipeline(
         player_template,
         bid_template,
-        parquet_path,
+        bbb_dir=None,
         player_role_df=None,
 ):
     
-    full_training_df = build_training_df(player_template, bid_template, parquet_path)
+    full_training_df = build_training_df(player_template, bid_template, bbb_dir)
 
     ################################################################
     # Player roles, built once on the full concatenated frame -- see
@@ -233,10 +260,13 @@ def run_training_pipeline(
 def run_training_pipeline_with_holdout(
         player_template,
         bid_template,
-        parquet_path,
-        train_years,
-        val_years,
+        bbb_dir=None,
+        train_years=None,
+        val_years=None,
         player_role_df=None,
+        competitions=None,
+        overrides=None,
+        resolution=None,
 ):
     """
     Same as run_training_pipeline, but builds train_years and val_years
@@ -250,15 +280,45 @@ def run_training_pipeline_with_holdout(
     """
 
     ################################################################
-    # Build train / val dataframes as separate auction replays
+    # Build train / val dataframes as separate auction replays --
+    # but off ONE feature context, not two.
+    #
+    # Two contexts means two independent identity resolutions over two
+    # different sets of years, which is precisely the per-year splitting
+    # PlayerFeatureContext was written to prevent: the same auction playerId
+    # can land on one cricketer in train and another in val, and the model is
+    # then evaluated on a player it never saw. It also read and aggregated 2.4M
+    # deliveries twice for no benefit.
     ################################################################
 
+    if bbb_dir is None:
+        bbb_dir = DEFAULT_BBB_DIR
+    if resolution is None and os.path.exists(DEFAULT_RESOLUTION):
+        resolution = DEFAULT_RESOLUTION
+
+    feature_context = PlayerFeatureContext(
+        bbb_dir,
+        competitions=competitions,
+        overrides=overrides,
+        resolution=resolution,
+    )
+
+    # Registered over train + val together, so identity is one map across the
+    # whole split.
+    all_years = list(train_years) + list(val_years)
+    feature_context.register_rosters({
+        year: pd.read_csv(player_template.format(year=year))
+        for year in all_years
+    })
+
     train_df = build_training_df(
-        player_template, bid_template, parquet_path, years=train_years
+        player_template, bid_template, bbb_dir, years=train_years,
+        feature_context=feature_context,
     )
 
     val_df = build_training_df(
-        player_template, bid_template, parquet_path, years=val_years
+        player_template, bid_template, bbb_dir, years=val_years,
+        feature_context=feature_context,
     )
 
     ################################################################
