@@ -342,12 +342,9 @@ def build_training_samples(
     # Player Features
     ############################################################
 
-    player_features = (
-        player_feature_builder
-        .build_feature_table(
-            player_df["playerName"].tolist(),
-            auction_date,
-        )
+    player_features = player_feature_builder.build_feature_table(
+        player_df[["playerId", "playerName"]],
+        auction_date,
     )
 
     print(
@@ -355,10 +352,12 @@ def build_training_samples(
         player_features.shape
     )
 
+    before = len(training_df)
     training_df = training_df.merge(
-        player_features,
-        on="playerName",
-        how="left"
+        player_features.drop(columns=["playerName"]),
+        on="playerId",
+        how="left",
+        validate="many_to_one",     # <-- crashes instead of silently fanning out
     )
 
     ############################################################
@@ -405,47 +404,30 @@ def build_training_samples(
         "playsForTeam",
 
         "role",
-
     }
 
     training_df.attrs["player_feature_columns"] = [
-
         c
-
         for c in player_features.columns
-
         if c != "playerName"
-
     ]
 
     training_df.attrs["auction_state_columns"] = [
-
         c
-
         for c in auction_state_df.columns
-
         if c not in metadata_columns
-
     ]
 
     training_df.attrs["team_state_columns"] = [
-
         c
-
         for c in team_state_df.columns
-
         if c not in metadata_columns
-
     ]
 
     training_df.attrs["bid_summary_columns"] = [
-
         c
-
         for c in bid_summary_df.columns
-
         if c not in metadata_columns
-
     ]
 
     return training_df
