@@ -1,17 +1,61 @@
-seed: 42
+# Read by src/training.py. Anything not listed here falls back to the
+# default in the code, so this file is safe to trim.
+
+seed: 42          # now actually applied, via set_seed() -- it was
+                  # previously read by nothing, so no run reproduced
 
 training:
-  epochs: 20
+
+  # Was 20 with no stopping criterion. Validation loss bottoms out
+  # within the first few epochs on this data and then climbs while
+  # training loss keeps falling, so a fixed run returned a model well
+  # past its best. The ceiling is high because early stopping, not the
+  # epoch count, is what ends the run now.
+  epochs: 150
+
   batch_size: 256
   learning_rate: 0.0003
-  weight_decay: 0.0
+
+  # Was 0.0. With ~92 player features against a few thousand
+  # informative rows, and roles and team embeddings on top, the model
+  # has ample capacity to memorise the training auctions.
+  weight_decay: 0.0001
+
+  # Stop when validation loss has not improved for this many epochs,
+  # and put the best weights back before evaluating -- without the
+  # restore, stopping early only saves time and you still score the
+  # overfit model.
+  early_stopping_patience: 12
+  early_stopping_min_delta: 0.001
+  restore_best_weights: true
 
 model:
-  player_dim: 120
-  team_state_dim: 30
-  auction_state_dim: 25
 
-  num_archetypes: 8
-  num_teams: 10
+  # player_dim, team_state_dim, auction_state_dim, num_role_features
+  # and num_teams are all OVERWRITTEN at runtime from the built
+  # frame's attrs. They are left out deliberately: values here would
+  # look authoritative and be ignored. player_dim in particular moves
+  # whenever the feature set changes (it just gained
+  # identity_unresolved), so a hardcoded number is a trap.
 
   embedding_dim: 16
+
+  # Standard deviation of the LogNormal, in log space. 3.0 was wide
+  # enough that a median of 279,497 still put real mass on a sale at
+  # 1,575, so the model could satisfy the interval likelihood by
+  # widening sigma instead of learning a valuation. 1.5 still allows a
+  # ~8000x three-sigma band. Watch predicted_sigma: if it pins near
+  # this ceiling for most rows, the model is hedging again.
+  sigma_min: 0.05
+  sigma_max: 1.5
+
+  # Starting point for every player's median valuation, in lakh. The
+  # mu head is zero-initialised with its bias here, so training begins
+  # by predicting this for everyone and learns deviations from it.
+  mu_prior_lakh: 50.0
+
+  # Bound on the auction adjustment, in log space: phi lands in
+  # [e^-1.5, e^1.5] ~= [0.22, 4.5]. Team context can plausibly move a
+  # valuation by a factor of a few; unbounded, this head absorbed the
+  # entire prediction rather than adjusting one.
+  max_log_phi: 1.5

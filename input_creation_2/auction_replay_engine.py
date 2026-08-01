@@ -2,6 +2,8 @@ import numpy as np
 import pandas as pd
 import re
 
+from input_creation_2.auction_order import resolve_auction_order
+
 
 
 class AuctionReplayEngine:
@@ -273,11 +275,23 @@ class AuctionReplayEngine:
             .reset_index(drop=True)
         )
 
-        # player_df arrives in REVERSE bidding order (row 0 is the
-        # last player who went under the hammer). There's no explicit
-        # order column, so we recover chronological order by simply
-        # reversing the frame rather than sorting on anything.
-        self.player_df = self.player_df.iloc[::-1].reset_index(drop=True)
+        # Auction order.
+        #
+        # This used to be an unconditional `self.player_df.iloc[::-1]`
+        # on the assumption the file arrives newest-first. The
+        # assumption is load-bearing -- auction_order,
+        # players_remaining and every purse trajectory come from it --
+        # and nothing checked it, so a forward-ordered file produced a
+        # well-formed frame describing an auction that ran backwards.
+        #
+        # resolve_auction_order prefers an explicit lot/timestamp
+        # column when the file has one, and otherwise picks a direction
+        # by testing which one keeps every team's running spend inside
+        # its purse. See input_creation_2/auction_order.py.
+        self.player_df, self.order_decision = resolve_auction_order(
+            self.player_df,
+            self.auction_max_purse,
+        )
 
         # ---------------------------------------------------------
         # Participating teams
@@ -1222,6 +1236,9 @@ class AuctionReplayEngine:
         }
 
         report["bid_order_source"] = self.bid_order_source
+        report["auction_order_method"] = self.order_decision["method"]
+        report["auction_order_column"] = self.order_decision["column"]
+        report["auction_order_warning"] = self.order_decision["warning"]
         report["non_monotone_ladders"] = len(self.non_monotone_ladders)
         report["final_state_violations"] = len(
             getattr(self, "final_state_violations", [])

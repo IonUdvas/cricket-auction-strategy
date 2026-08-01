@@ -83,6 +83,40 @@ class SquadIndex:
             zip(squads["season"].str[:4], squads["team"], squads["pid"])
         )
 
+    def _keys(self, season, franchise):
+        names = FRANCHISE_NAMES.get(str(franchise).strip().upper())
+        if not names:
+            return []
+        return [(str(season)[:4], name) for name in names]
+
+    def members(self, season, team):
+        """
+        Everyone who took the field for `team` in `season`.
+
+        Used by identity triage rather than by resolution: if a
+        playerId was listed with a franchise-season the ball data
+        covers, and no candidate of his is in that squad, he almost
+        certainly has no T20 record rather than a mis-spelled one.
+        """
+        out = set()
+        for key in self._keys(season, team):
+            out |= {
+                pid for (yr, tm, pid) in self._members
+                if (yr, tm) == key
+            }
+        return out
+
+    def covers(self, season, team):
+        """
+        Whether the ball data has ANY record of this franchise-season.
+
+        Distinguishes "he was not in that squad" from "that season has
+        not been played yet".  The 2026 auction has no 2026 ball data,
+        so an empty squad there means nothing at all -- treating it as
+        evidence would mark every 2026 signing as having no T20 record.
+        """
+        return len(self.members(season, team)) > 0
+
     def narrow(self, candidates, season, franchise):
         """
         Restrict `candidates` to those who actually played for `franchise` in

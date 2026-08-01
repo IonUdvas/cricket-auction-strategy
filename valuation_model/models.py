@@ -12,6 +12,9 @@ class IntrinsicValuationNetwork(nn.Module):
         num_role_features,
         num_teams,
         embedding_dim=16,
+        sigma_min=0.05,
+        sigma_max=1.5,
+        mu_prior=50.0,
     ):
         super().__init__()
 
@@ -67,7 +70,7 @@ class IntrinsicValuationNetwork(nn.Module):
         # [sigma_min, sigma_max], and the gradient stays nonzero
         # everywhere (just small at the extremes), so there's always
         # some pull back toward the interior.
-        self.sigma_min = 0.05
+        self.sigma_min = sigma_min
         # sigma is the standard deviation in LOG space, so 3.0 spans
         # e^(6*3) ~= 6e7 across a 3-sigma band -- wide enough that a
         # median of 279,497 still puts real mass on an actual sale at
@@ -78,7 +81,7 @@ class IntrinsicValuationNetwork(nn.Module):
         # within_interval ~= 0.09.  1.5 still allows a ~8000x
         # 3-sigma band, which is ample for auction prices spanning
         # 30 lakh to 27 crore.
-        self.sigma_max = 1.5
+        self.sigma_max = sigma_max
 
         ############################################################
         # Anchor mu where prices actually live.
@@ -91,7 +94,7 @@ class IntrinsicValuationNetwork(nn.Module):
         ############################################################
 
         nn.init.zeros_(self.mu_head.weight)
-        nn.init.constant_(self.mu_head.bias, math.log(50.0))
+        nn.init.constant_(self.mu_head.bias, math.log(mu_prior))
 
         nn.init.zeros_(self.sigma_head.weight)
         nn.init.zeros_(self.sigma_head.bias)
@@ -126,7 +129,8 @@ class AuctionAdjustmentNetwork(nn.Module):
     def __init__(
         self,
         team_state_dim,
-        auction_state_dim
+        auction_state_dim,
+        max_log_phi=1.5,
     ):
         super().__init__()
 
@@ -172,7 +176,7 @@ class AuctionAdjustmentNetwork(nn.Module):
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
 
-        self.max_log_phi = 1.5
+        self.max_log_phi = max_log_phi
 
     def forward(
         self,
@@ -200,19 +204,27 @@ class ValuationModel(nn.Module):
         auction_state_dim,
         num_role_features,
         num_teams,
-        embedding_dim=16
+        embedding_dim=16,
+        sigma_min=0.05,
+        sigma_max=1.5,
+        mu_prior=50.0,
+        max_log_phi=1.5,
     ):
         super().__init__()
         self.intrinsic = IntrinsicValuationNetwork(
             player_dim=player_dim,
             num_role_features=num_role_features,
             num_teams=num_teams,
-            embedding_dim=embedding_dim
+            embedding_dim=embedding_dim,
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
+            mu_prior=mu_prior,
         )
 
         self.auction = AuctionAdjustmentNetwork(
             team_state_dim=team_state_dim,
-            auction_state_dim=auction_state_dim
+            auction_state_dim=auction_state_dim,
+            max_log_phi=max_log_phi,
         )
 
     def forward(

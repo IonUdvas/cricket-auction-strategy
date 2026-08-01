@@ -143,6 +143,30 @@ class PlayerFeatureContext:
         features = pd.DataFrame(rows)
         features.insert(0, "playerId", roster["playerId"].to_numpy())
 
+        ############################################################
+        # identity_unresolved
+        #
+        # An unresolved playerId and a genuine uncapped debutant both
+        # produce an all-zero career with has_history = 0. They are
+        # not the same statement. One says "this player has never
+        # played a T20"; the other says "we could not look this player
+        # up", and that second group contains capped internationals
+        # whose real careers are simply missing.
+        #
+        # Without this flag the model has to average over both, which
+        # drags every genuine debutant's valuation up toward the
+        # unlookuppable veterans and every veteran's down. With it, the
+        # network can learn a separate offset for "unknown identity" --
+        # the same reason PlayerFeatureBuilder already emits a
+        # *_is_missing companion for every metric that can be
+        # undefined.
+        ############################################################
+
+        features["identity_unresolved"] = [
+            0.0 if pid_ in self.person_by_player else 1.0
+            for pid_ in roster["playerId"]
+        ]
+
         assert len(features) == len(roster), "feature table lost or gained rows"
         assert features["playerId"].is_unique, "duplicate playerId in features"
         return features

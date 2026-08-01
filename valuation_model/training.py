@@ -409,6 +409,9 @@ def train(
     epochs,
     valid_loader=None,
     max_grad_norm=5.0,
+    patience=None,
+    min_delta=0.0,
+    restore_best=True,
 ):
     """
     Complete training loop.
@@ -418,17 +421,42 @@ def train(
     max_grad_norm : float or None
         Passed through to `train_one_epoch` each epoch -- see there
         for why this replaced the old nll clamp.
+    patience : int or None
+        Stop after this many epochs with no improvement in validation
+        loss. None disables early stopping.
+
+        This is not optional polish. Validation loss on this task
+        bottoms out within the first handful of epochs and then climbs
+        while training loss keeps falling, so a fixed 20-epoch run
+        returns a model from well past its best point -- and, worse,
+        makes feature work unreadable: a new feature that genuinely
+        helps and a model that simply memorised more both show up as
+        lower training loss.
+    min_delta : float
+        Improvement smaller than this does not reset the counter.
+    restore_best : bool
+        Load the best-validation weights back into `model` before
+        returning. Without this, early stopping only saves time; the
+        model you evaluate is still the overfit one from the last
+        epoch.
 
     Returns
     -------
     history : dict
-        Dictionary containing metric history.
+        Metric history, plus "best_epoch" and "best_valid_loss".
     """
 
     history = {
         "train": [],
         "valid": [],
+        "best_epoch": None,
+        "best_valid_loss": None,
     }
+
+    best_loss = float("inf")
+    best_state = None
+    best_epoch = None
+    since_improvement = 0
 
     for epoch in range(epochs):
 
@@ -462,11 +490,33 @@ def train(
 
             history["valid"].append(valid_stats)
 
+            improved = valid_stats["loss"] < best_loss - min_delta
+
+            if improved:
+                best_loss = valid_stats["loss"]
+                best_epoch = epoch + 1
+                since_improvement = 0
+                if restore_best:
+                    best_state = {
+                        k: v.detach().clone()
+                        for k, v in model.state_dict().items()
+                    }
+            else:
+                since_improvement += 1
+
             print(
                 f"Epoch {epoch+1:3d}/{epochs} | "
                 f"Train Loss: {train_stats['loss']:.4f} | "
                 f"Valid Loss: {valid_stats['loss']:.4f}"
+                f"{'  *' if improved else ''}"
             )
+
+            if patience is not None and since_improvement >= patience:
+                print(
+                    f"Early stop: no improvement for {patience} epochs. "
+                    f"Best was epoch {best_epoch} at {best_loss:.4f}."
+                )
+                break
 
         else:
 
@@ -474,5 +524,15 @@ def train(
                 f"Epoch {epoch+1:3d}/{epochs} | "
                 f"Train Loss: {train_stats['loss']:.4f}"
             )
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        print(
+            f"Restored weights from epoch {best_epoch} "
+            f"(valid loss {best_loss:.4f})."
+        )
+
+    history["best_epoch"] = best_epoch
+    history["best_valid_loss"] = best_loss if best_epoch else None
 
     return history

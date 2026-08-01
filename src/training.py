@@ -15,7 +15,10 @@ from valuation_model.training import *
 from valuation_model.scaling import fit_scalers
 from torch.utils.data import DataLoader
 
+import numpy as np
 import pandas as pd
+import random
+import torch
 import yaml
 
 import os
@@ -29,6 +32,24 @@ CONFIG_PATH = os.environ.get(
 
 with open(CONFIG_PATH, "r") as f:
     config = yaml.safe_load(f)
+
+
+def set_seed(seed=None):
+    """
+    `seed: 42` sat in default.yaml and was read by nothing, so no run
+    was reproducible: weight init, DataLoader shuffling and the
+    train/val batch composition all varied between runs. That makes
+    small effects unmeasurable -- a feature worth 0.02 nats is
+    indistinguishable from run-to-run noise until this is fixed.
+    """
+    if seed is None:
+        seed = config.get("seed")
+    if seed is None:
+        return
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 # The ball data is a DIRECTORY of parquets written by data.build_bbb
 # (deliveries / fielding / people / wickets / matches), not the single flat
@@ -187,6 +208,8 @@ def run_training_pipeline(
         player_role_df=None,
 ):
     
+    set_seed()
+
     full_training_df = build_training_df(player_template, bid_template, bbb_dir)
 
     ################################################################
@@ -359,6 +382,8 @@ def run_training_pipeline_with_holdout(
     # deliveries twice for no benefit.
     ################################################################
 
+    set_seed()
+
     if bbb_dir is None:
         bbb_dir = DEFAULT_BBB_DIR
     if resolution is None and os.path.exists(DEFAULT_RESOLUTION):
@@ -509,6 +534,10 @@ def run_training_pipeline_with_holdout(
         num_role_features=config["model"]["num_role_features"],
         num_teams=config["model"]["num_teams"],
         embedding_dim=config["model"]["embedding_dim"],
+        sigma_min=config["model"].get("sigma_min", 0.05),
+        sigma_max=config["model"].get("sigma_max", 1.5),
+        mu_prior=config["model"].get("mu_prior_lakh", 50.0),
+        max_log_phi=config["model"].get("max_log_phi", 1.5),
     )
 
     criterion = IntervalCensoredLoss()
@@ -531,6 +560,9 @@ def run_training_pipeline_with_holdout(
         device=device,
         epochs=config["training"]["epochs"],
         valid_loader=val_loader,
+        patience=config["training"].get("early_stopping_patience"),
+        min_delta=config["training"].get("early_stopping_min_delta", 0.0),
+        restore_best=config["training"].get("restore_best_weights", True),
     )
 
     val_predictions = evaluate_predictions(
