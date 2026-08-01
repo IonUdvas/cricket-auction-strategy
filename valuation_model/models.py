@@ -4,6 +4,35 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+def build_mlp(input_dim, hidden_dims, dropout=0.0):
+    """
+    Stack of Linear -> ReLU (-> Dropout), returning (module, out_dim).
+
+    Both towers used to hardcode their widths -- [256, 128, 64] and
+    [128, 64] -- so the only way to shrink the model for a dataset
+    this size was to edit the class. Depth and width are the first
+    knobs you want when ~1,700 informative rows are training ~90k
+    parameters, so they belong in the config.
+
+    An empty hidden_dims is legal and gives a linear model straight
+    from the feature block to the heads; that is a genuinely useful
+    baseline here and is worth running before anything deeper.
+    """
+
+    layers = []
+    dim = input_dim
+
+    for width in hidden_dims:
+        layers.append(nn.Linear(dim, width))
+        layers.append(nn.ReLU())
+        if dropout and dropout > 0.0:
+            layers.append(nn.Dropout(dropout))
+        dim = width
+
+    return nn.Sequential(*layers), dim
+
+
 class IntrinsicValuationNetwork(nn.Module):
 
     def __init__(
@@ -15,6 +44,8 @@ class IntrinsicValuationNetwork(nn.Module):
         sigma_min=0.05,
         sigma_max=1.5,
         mu_prior=50.0,
+        hidden_dims=(64, 32),
+        dropout=0.0,
     ):
         super().__init__()
 
@@ -42,19 +73,14 @@ class IntrinsicValuationNetwork(nn.Module):
 
         input_dim = player_dim + 2 * embedding_dim
 
-        self.network = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-
-            nn.Linear(256,128),
-            nn.ReLU(),
-
-            nn.Linear(128,64),
-            nn.ReLU()
+        self.network, head_dim = build_mlp(
+            input_dim,
+            hidden_dims,
+            dropout=dropout,
         )
 
-        self.mu_head = nn.Linear(64,1)
-        self.sigma_head = nn.Linear(64,1)
+        self.mu_head = nn.Linear(head_dim, 1)
+        self.sigma_head = nn.Linear(head_dim, 1)
 
         # Bound sigma smoothly in [sigma_min, sigma_max] via a
         # sigmoid, rather than an unbounded softplus that only gets
@@ -131,6 +157,8 @@ class AuctionAdjustmentNetwork(nn.Module):
         team_state_dim,
         auction_state_dim,
         max_log_phi=1.5,
+        hidden_dims=(32,),
+        dropout=0.0,
     ):
         super().__init__()
 
@@ -139,17 +167,18 @@ class AuctionAdjustmentNetwork(nn.Module):
             + auction_state_dim
         )
 
-        self.network = nn.Sequential(
-
-            nn.Linear(input_dim,128),
-            nn.ReLU(),
-
-            nn.Linear(128,64),
-            nn.ReLU(),
-
+        # 16 inputs, of which several are near-duplicates
+        # (players_bought vs remaining_slots; auction_order vs
+        # players_completed vs players_remaining), feeding a bounded
+        # scalar correction. [128, 64] was ~11k parameters to produce
+        # one number in [-1.5, 1.5].
+        self.network, head_dim = build_mlp(
+            input_dim,
+            hidden_dims,
+            dropout=dropout,
         )
 
-        self.head = nn.Linear(64,1)
+        self.head = nn.Linear(head_dim, 1)
 
         ############################################################
         # log_phi is a *correction* to an intrinsic valuation, not a
@@ -209,6 +238,9 @@ class ValuationModel(nn.Module):
         sigma_max=1.5,
         mu_prior=50.0,
         max_log_phi=1.5,
+        intrinsic_hidden_dims=(64, 32),
+        auction_hidden_dims=(32,),
+        dropout=0.0,
     ):
         super().__init__()
         self.intrinsic = IntrinsicValuationNetwork(
@@ -219,12 +251,52 @@ class ValuationModel(nn.Module):
             sigma_min=sigma_min,
             sigma_max=sigma_max,
             mu_prior=mu_prior,
+            hidden_dims=intrinsic_hidden_dims,
+            dropout=dropout,
         )
 
         self.auction = AuctionAdjustmentNetwork(
             team_state_dim=team_state_dim,
             auction_state_dim=auction_state_dim,
             max_log_phi=max_log_phi,
+            hidden_dims=auction_hidden_dims,
+            dropout=dropout,
+        )
+
+    @classmethod
+    def from_config(cls, config, dims):
+        """
+        Build from the `model` block of the config plus the runtime
+        dims read off the built frame.
+
+        Every knob reaches the model through here, so a value in the
+        config can no longer be quietly ignored -- which is what was
+        happening to sigma_min, sigma_max, mu_prior_lakh and
+        max_log_phi, all of which were in configs/default.yaml with
+        explanatory comments and none of which were passed to the
+        constructor by src/training.py.
+        """
+
+        model_cfg = dict(config.get("model", {}))
+
+        return cls(
+            player_dim=dims["player_dim"],
+            team_state_dim=dims["team_state_dim"],
+            auction_state_dim=dims["auction_state_dim"],
+            num_role_features=dims["num_role_features"],
+            num_teams=dims["num_teams"],
+            embedding_dim=model_cfg.get("embedding_dim", 16),
+            sigma_min=model_cfg.get("sigma_min", 0.05),
+            sigma_max=model_cfg.get("sigma_max", 1.5),
+            mu_prior=model_cfg.get("mu_prior_lakh", 50.0),
+            max_log_phi=model_cfg.get("max_log_phi", 1.5),
+            intrinsic_hidden_dims=tuple(
+                model_cfg.get("intrinsic_hidden_dims", (64, 32))
+            ),
+            auction_hidden_dims=tuple(
+                model_cfg.get("auction_hidden_dims", (32,))
+            ),
+            dropout=model_cfg.get("dropout", 0.0),
         )
 
     def forward(

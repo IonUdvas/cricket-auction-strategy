@@ -1,61 +1,185 @@
 # Read by src/training.py. Anything not listed here falls back to the
 # default in the code, so this file is safe to trim.
+#
+# Every key below is now actually reached by the pipeline. That was
+# NOT previously true, and it is the single biggest change here:
+# seed, the three early_stopping_* keys, sigma_min, sigma_max,
+# mu_prior_lakh and max_log_phi were all parsed into `config` and
+# then never passed to anything. The 150-epoch run in the last report
+# is what that looks like from outside -- early_stopping_patience: 12
+# was sitting in this file the whole time.
+#
+# CALIBRATE YOUR EXPECTATIONS BEFORE TUNING ANYTHING BELOW.
+# The validation split is one auction: 1,560 rows, 77 of them actual
+# sales. Re-running a single fixed config under four seeds moves
+# winner medAE from 42 to 69 lakh and spearman from 0.61 to 0.71 --
+# as much as changing the model from 513 to 84,083 parameters does.
+# Use src.experiments.run_seeds and compare medians across >=5 seeds.
+# A single run cannot tell you whether a change helped.
 
-seed: 42          # now actually applied, via set_seed() -- it was
-                  # previously read by nothing, so no run reproduced
+seed: 42
+
+data:
+
+  # VERIFIED FIX. Fit BlockScalers on the TRAIN split, apply to both.
+  # valuation_model/scaling.py existed for exactly this, its docstring
+  # explains why, IPLAuctionDataset already took a `scalers=`
+  # argument -- and nothing in the repo ever called fit_scalers, so
+  # both datasets were built on the raw path its own docstring calls
+  # "only ever right for a smoke test".
+  #
+  # Measured on the built frame: bat_runs reaches 10,673 and
+  # bowl_runs 12,080 in the same nn.Linear as 0/1 missing-flags and
+  # rates in [0, 1]; remaining_purse reaches 11,050 in the team
+  # block. At default init the pre-activation spread is set by
+  # whichever column is largest, so the first layer reads three or
+  # four career-total columns and treats the other ~85 as noise.
+  scale_features: true
+
+  # DEFENSIVE, currently a no-op for you. With archetype_df_filtered
+  # (the 24 boolean tags + player_id/country/capped_status/
+  # is_overseas, the last three of which build_role_table already
+  # drops as duplicates of what the replay engine attaches) the role
+  # block is 24 tags and none of these guards fire.
+  #
+  # They matter if the UNFILTERED player_archetypes.csv is ever
+  # passed instead. build_role_table's fallback one-hot expands any
+  # non-numeric column, and the unfiltered table carries
+  # auction_name, cricbuzz_name, bbb_player, date_of_birth and the
+  # raw archetype strings -- which expands to 3,409 of 3,467 "role"
+  # features, i.e. a private column per player. Cheap insurance
+  # against passing the wrong frame, nothing more.
+  #
+  # ROLE_IDENTITY_COLUMNS / ROLE_LEAKY_COLUMNS are defined in
+  # input_creation_2/auction_dataset_utils.py. 24 admits
+  # bowling_style (10 values) and rejects anything player-specific.
+  drop_role_identity_columns: true
+  drop_role_leaky_columns: true
+  max_role_cardinality: 24
 
 training:
 
-  # Was 20 with no stopping criterion. Validation loss bottoms out
-  # within the first few epochs on this data and then climbs while
-  # training loss keeps falling, so a fixed run returned a model well
-  # past its best. The ceiling is high because early stopping, not the
-  # epoch count, is what ends the run now.
+  # The ceiling, not the plan: early stopping is what ends the run.
+  # Best epoch lands between 2 and 31 depending on seed.
   epochs: 150
 
+  # VERIFIED FIX -- not the value, the plumbing. 256 was only ever
+  # used by the holdout pipeline; load_and_encode_data hardcoded 64,
+  # so the two pipelines trained at different batch sizes and only
+  # one of them used this file. Both read it now.
+  #
+  # Value left at 256 because I have no evidence for changing it.
+  # Worth sweeping: ~14.9k training rows but only ~1.7k non-'left',
+  # so a batch of 256 carries roughly 30 informative rows.
   batch_size: 256
-  learning_rate: 0.0003
 
-  # Was 0.0. With ~92 player features against a few thousand
-  # informative rows, and roles and team embeddings on top, the model
-  # has ample capacity to memorise the training auctions.
+  learning_rate: 0.0003   # 1e-4 and 1e-3 both swept; no clear winner
+
+  # Value unchanged. What changed is WHERE it applies: build_optimizer
+  # now puts biases, 1-D parameters and both embedding tables in a
+  # no-decay group. Decaying the mu-head bias pulls it off its
+  # log(mu_prior) initialisation, and decaying the team embedding
+  # shrinks every team toward a shared zero -- neither is the
+  # regularisation you were asking for. The weight matrices are what
+  # overfit.
   weight_decay: 0.0001
 
-  # Stop when validation loss has not improved for this many epochs,
-  # and put the best weights back before evaluating -- without the
-  # restore, stopping early only saves time and you still score the
-  # overfit model.
+  # VERIFIED FIX. These three keys existed here and were never passed
+  # to train(), which has accepted them since it was written. The
+  # last run went the full 150 epochs and only recovered epoch 27
+  # because restore_best_weights happens to default to True inside
+  # train() -- it spent 123 epochs driving validation loss from 2.68
+  # to 6.25 for nothing.
   early_stopping_patience: 12
   early_stopping_min_delta: 0.001
   restore_best_weights: true
 
+  # Was hardcoded in train(). Bounds the update for pathological
+  # samples without zeroing any individual sample's gradient.
+  max_grad_norm: 5.0
+
 model:
 
   # player_dim, team_state_dim, auction_state_dim, num_role_features
-  # and num_teams are all OVERWRITTEN at runtime from the built
-  # frame's attrs. They are left out deliberately: values here would
-  # look authoritative and be ignored. player_dim in particular moves
-  # whenever the feature set changes (it just gained
-  # identity_unresolved), so a hardcoded number is a trap.
+  # and num_teams are OVERWRITTEN at runtime from the built frame's
+  # attrs. Left out deliberately: values here would look
+  # authoritative and be ignored.
 
+  ##################################################################
+  # Capacity. This is your "large model, low data" instinct, and the
+  # numbers back it -- though not via validation loss.
+  #
+  # You have 14,920 training rows but only 1,720 are non-'left'. The
+  # other 13,199 are one-sided bounds at base price that mostly say
+  # "nobody bid". The real sample is ~1,720, not ~14,900.
+  #
+  # The towers were hardcoded at [256, 128, 64] and [128, 64]:
+  # 84,083 parameters, ~49 per informative row. [64, 32] / [32] is
+  # 9,915, ~5.8 per informative row.
+  #
+  # Honest reporting of what the sweep showed: across 513 to 84,083
+  # parameters, best validation loss moved only 2.688 -> 2.804, and
+  # that spread is the same size as the seed-to-seed spread on ONE
+  # config. So the sweep does NOT establish that the small model is
+  # better on loss. What it does establish is that the extra 74,000
+  # parameters buy nothing measurable, while the train/valid gap at
+  # the best epoch is consistently worse for the big model. Smaller
+  # is the right default when the capacity is provably unused.
+  #
+  # Ladder, in order -- re-run each with run_seeds, stop at the first
+  # rung where the median stops improving:
+  #     []              linear baseline, 513 params; run this first
+  #     [32]
+  #     [64, 32]        <- current
+  #     [128, 64]
+  intrinsic_hidden_dims: [64, 32]
+
+  # 16 inputs -- several near-duplicates (players_bought vs
+  # remaining_slots are perfectly collinear; auction_order,
+  # players_completed and players_remaining are three copies of one
+  # variable) -- producing one bounded scalar in [-max_log_phi,
+  # max_log_phi]. [128, 64] was ~11k parameters for that.
+  auction_hidden_dims: [32]
+
+  # Applied after every hidden ReLU in both towers. UNVERIFIED at
+  # this value -- swept only at 0.1 and not distinguishable from
+  # noise. Kept because it is the cheapest capacity control that does
+  # not require re-picking widths.
+  dropout: 0.1
+
+  # Unchanged at 16; 8 was swept and made no measurable difference.
+  # Now actually reaches the model, which it did before only because
+  # it was the one model key src/training.py bothered to pass.
   embedding_dim: 16
 
-  # Standard deviation of the LogNormal, in log space. 3.0 was wide
-  # enough that a median of 279,497 still put real mass on a sale at
-  # 1,575, so the model could satisfy the interval likelihood by
-  # widening sigma instead of learning a valuation. 1.5 still allows a
-  # ~8000x three-sigma band. Watch predicted_sigma: if it pins near
-  # this ceiling for most rows, the model is hedging again.
+  ##################################################################
+  # sigma is the width of the LogNormal, in log space, and it is
+  # currently SATURATED. This is the live modelling problem.
+  #
+  # Set the ceiling and the mean follows it:
+  #     sigma_max 1.5 -> mean sigma 1.19
+  #     sigma_max 1.0 -> mean sigma 0.99
+  #     sigma_max 0.8 -> mean sigma 0.79
+  #
+  # The model is satisfying the interval likelihood by making every
+  # prediction vague rather than by making it right. Squeezing the
+  # ceiling does not stop that -- it relocates it, and validation
+  # loss gets worse as you squeeze (2.76 -> 2.87 at 0.8), which says
+  # the width is doing work in the likelihood that the mean is not.
+  #
+  # Left at 1.5 deliberately: lowering it treats the symptom. Watch
+  # sigma_saturation from src.experiments.summarize_predictions --
+  # it should fall on its own as the point estimates improve.
+  ##################################################################
   sigma_min: 0.05
   sigma_max: 1.5
 
   # Starting point for every player's median valuation, in lakh. The
-  # mu head is zero-initialised with its bias here, so training begins
-  # by predicting this for everyone and learns deviations from it.
+  # mu head is zero-initialised with its bias at log(this), so
+  # training begins by predicting this for everyone and learns
+  # deviations. NOW ACTUALLY PASSED to the model -- it was not.
   mu_prior_lakh: 50.0
 
   # Bound on the auction adjustment, in log space: phi lands in
-  # [e^-1.5, e^1.5] ~= [0.22, 4.5]. Team context can plausibly move a
-  # valuation by a factor of a few; unbounded, this head absorbed the
-  # entire prediction rather than adjusting one.
+  # [e^-1.5, e^1.5] ~= [0.22, 4.5]. NOW ACTUALLY PASSED.
   max_log_phi: 1.5

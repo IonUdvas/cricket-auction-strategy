@@ -8,12 +8,15 @@ from input_creation_2.auction_dataset import IPLAuctionDataset
 from valuation_model.models import *
 from valuation_model.losses import *
 from valuation_model.training import *
+from valuation_model.scaling import fit_scalers
 from torch.utils.data import DataLoader
 
+import numpy as np
 import pandas as pd
 import yaml
 
 import os
+import random
 
 # Resolve relative to this file rather than a hardcoded Kaggle path, so the
 # module imports on a laptop, in CI and on Kaggle alike.
@@ -24,6 +27,104 @@ CONFIG_PATH = os.environ.get(
 
 with open(CONFIG_PATH, "r") as f:
     config = yaml.safe_load(f)
+
+
+def set_seed(seed=None):
+    """
+    Seed python / numpy / torch.
+
+    configs/default.yaml has carried `seed: 42` with a comment saying
+    it was "now actually applied, via set_seed()". No such function
+    existed anywhere in the repo, so every run to date has had a
+    different init, a different shuffle order and a different
+    train/val curve. That matters more than usual here: with a
+    validation set of 1,560 rows and 77 winners, run-to-run noise is
+    comparable to the effect sizes being compared.
+    """
+
+    if seed is None:
+        seed = config.get("seed")
+    if seed is None:
+        return None
+
+    seed = int(seed)
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    return seed
+
+
+def _model_dims(frame, encoder_manager):
+    """Runtime dims, read off the built frame rather than the config."""
+
+    return {
+        "player_dim": len(frame.attrs["player_feature_columns"]),
+        "team_state_dim": len(frame.attrs["team_state_columns"]),
+        "auction_state_dim": len(frame.attrs["auction_state_columns"]),
+        "num_role_features": len(frame.attrs["role_columns"]),
+        "num_teams": len(encoder_manager.get_encoder("team").classes_),
+    }
+
+
+def build_optimizer(model, cfg=None):
+    """
+    Adam, with weight decay applied only where it means something.
+
+    Decaying biases, the sigma head and the two embedding tables is
+    not regularisation of the same kind as decaying a weight matrix:
+    it pulls the mu-head bias away from its log(mu_prior)
+    initialisation and shrinks every team embedding toward a shared
+    zero, which is a prior nobody asked for. The weight matrices are
+    what actually overfit.
+    """
+
+    cfg = (cfg or config)["training"]
+    decay_value = cfg.get("weight_decay", 0.0)
+
+    decay, no_decay = [], []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param.ndim <= 1 or "embedding" in name:
+            no_decay.append(param)
+        else:
+            decay.append(param)
+
+    return torch.optim.Adam(
+        [
+            {"params": decay, "weight_decay": decay_value},
+            {"params": no_decay, "weight_decay": 0.0},
+        ],
+        lr=cfg.get("learning_rate", 3e-4),
+    )
+
+
+def _train_kwargs(cfg=None):
+    """
+    Early-stopping settings, read from the config.
+
+    `train()` has taken patience / min_delta / restore_best since it
+    was written and neither pipeline ever passed them, so the three
+    early_stopping_* keys in configs/default.yaml did nothing. The
+    150-epoch run in the last log is the visible consequence: it ran
+    to completion, restored epoch 27 out of luck because
+    restore_best defaults to True, and spent 123 epochs after the
+    best one driving validation loss from 2.68 to 6.25.
+    """
+
+    cfg = (cfg or config)["training"]
+
+    return {
+        "epochs": cfg.get("epochs", 150),
+        "patience": cfg.get("early_stopping_patience"),
+        "min_delta": cfg.get("early_stopping_min_delta", 0.0),
+        "restore_best": cfg.get("restore_best_weights", True),
+        "max_grad_norm": cfg.get("max_grad_norm", 5.0),
+    }
 
 # The ball data is a DIRECTORY of parquets written by data.build_bbb
 # (deliveries / fielding / people / wickets / matches), not the single flat
@@ -147,17 +248,22 @@ def build_training_df(
 
     return full_training_df
 
-def load_and_encode_data(full_training_df):
+def load_and_encode_data(full_training_df, scalers=None):
     encoder_manager = build_encoders(full_training_df)
 
     dataset = IPLAuctionDataset(
         full_training_df,
-        encoder_manager
+        encoder_manager,
+        scalers=scalers,
     )
 
+    # Was hardcoded to 64 while configs/default.yaml said 256, so the
+    # single-frame pipeline and the holdout pipeline trained at
+    # different batch sizes and only one of them was the configured
+    # one.
     loader = DataLoader(
         dataset,
-        batch_size=64,
+        batch_size=config["training"].get("batch_size", 256),
         shuffle=True
     )
 
@@ -170,6 +276,8 @@ def run_training_pipeline(
         player_role_df=None,
 ):
     
+    set_seed()
+
     full_training_df = build_training_df(player_template, bid_template, bbb_dir)
 
     ################################################################
@@ -178,9 +286,14 @@ def run_training_pipeline(
     # per-year.
     ################################################################
 
+    data_cfg = config.get("data", {}) or {}
+
     role_frame, role_columns = build_role_table(
         full_training_df,
         player_role_df=player_role_df,
+        max_role_cardinality=data_cfg.get("max_role_cardinality", 24),
+        drop_identity_columns=data_cfg.get("drop_role_identity_columns", True),
+        drop_leaky_columns=data_cfg.get("drop_role_leaky_columns", True),
     )
 
     # pd.concat(axis=1) returns a NEW frame and does not carry .attrs across,
@@ -197,37 +310,22 @@ def run_training_pipeline(
     full_training_df.attrs = _attrs
     full_training_df.attrs["role_columns"] = role_columns
 
-    encoder_manager, dataset, loader = load_and_encode_data(full_training_df)
-
-    config["model"]["player_dim"] = len(
-        full_training_df.attrs["player_feature_columns"]
+    # No holdout here, so there is no split to leak across: the
+    # scalers are fit on the one frame that exists.
+    scalers = (
+        fit_scalers(full_training_df)
+        if data_cfg.get("scale_features", True)
+        else None
     )
 
-    config["model"]["team_state_dim"] = len(
-        full_training_df.attrs["team_state_columns"]
+    encoder_manager, dataset, loader = load_and_encode_data(
+        full_training_df, scalers=scalers
     )
 
-    config["model"]["auction_state_dim"] = len(
-        full_training_df.attrs["auction_state_columns"]
-    )
+    dims = _model_dims(full_training_df, encoder_manager)
+    config["model"].update(dims)
 
-    config["model"]["num_role_features"] = len(
-        full_training_df.attrs["role_columns"]
-    )
-
-    config["model"]["num_teams"] = len(
-        encoder_manager.get_encoder("team").classes_
-    )
-
-    model = ValuationModel(
-        player_dim=config["model"]["player_dim"],
-        team_state_dim=config["model"]["team_state_dim"],
-        auction_state_dim=config["model"]["auction_state_dim"],
-        num_role_features=config["model"]["num_role_features"],
-        num_teams=config["model"]["num_teams"],
-        embedding_dim=config["model"]["embedding_dim"]
-
-    )
+    model = ValuationModel.from_config(config, dims)
 
     for name, p in model.named_parameters():
         if not torch.isfinite(p).all():
@@ -235,11 +333,7 @@ def run_training_pipeline(
 
     criterion = IntervalCensoredLoss()
 
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=config["training"]["learning_rate"],
-        weight_decay=config["training"]["weight_decay"]
-    )
+    optimizer = build_optimizer(model)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -251,7 +345,7 @@ def run_training_pipeline(
         criterion=criterion,
         optimizer=optimizer,
         device=device,
-        epochs=config["training"]["epochs"],
+        **_train_kwargs(),
     )
 
     return model, history, encoder_manager, dataset, loader, full_training_df
@@ -267,11 +361,22 @@ def run_training_pipeline_with_holdout(
         competitions=None,
         overrides=None,
         resolution=None,
+        scale_features=None,
 ):
     """
     Same as run_training_pipeline, but builds train_years and val_years
     as separate auctions, trains only on train_years, and evaluates
     (no gradient updates) on val_years each epoch.
+
+    scale_features : bool or None
+        Fit BlockScalers on the TRAIN frame and apply them to both
+        splits. None reads data.scale_features from the config
+        (default True). valuation_model/scaling.py has existed, with
+        a docstring explaining why raw career totals in the thousands
+        cannot share an nn.Linear with 0/1 flags, and nothing in the
+        repo ever called fit_scalers -- both datasets were built with
+        scalers=None, the path its own docstring calls "only ever
+        right for a smoke test".
 
     Example
     -------
@@ -290,6 +395,10 @@ def run_training_pipeline_with_holdout(
     # then evaluated on a player it never saw. It also read and aggregated 2.4M
     # deliveries twice for no benefit.
     ################################################################
+
+    seed = set_seed()
+    if seed is not None:
+        print(f"seed: {seed}")
 
     if bbb_dir is None:
         bbb_dir = DEFAULT_BBB_DIR
@@ -346,9 +455,14 @@ def run_training_pipeline_with_holdout(
     # contain any WICKETKEEPER-listed player that auction).
     ################################################################
 
+    data_cfg = config.get("data", {}) or {}
+
     role_frame, role_columns = build_role_table(
         combined_df,
         player_role_df=player_role_df,
+        max_role_cardinality=data_cfg.get("max_role_cardinality", 24),
+        drop_identity_columns=data_cfg.get("drop_role_identity_columns", True),
+        drop_leaky_columns=data_cfg.get("drop_role_leaky_columns", True),
     )
 
     # Preserve existing attrs 
@@ -368,8 +482,32 @@ def run_training_pipeline_with_holdout(
     train_df.attrs["role_columns"] = role_columns 
     val_df.attrs["role_columns"] = role_columns
 
-    train_dataset = IPLAuctionDataset(train_df, encoder_manager)
-    val_dataset = IPLAuctionDataset(val_df, encoder_manager)
+    ################################################################
+    # Input scaling: fit on TRAIN only, apply to both.
+    #
+    # Not optional on this data. The player block holds bat_runs up
+    # to 10,673 and bowl_runs up to 12,080 in the same nn.Linear as
+    # 0/1 missing-flags and rates in [0, 1]; team_state holds
+    # remaining_purse up to 11,050. At default Kaiming init the
+    # pre-activation spread is set by whichever column is largest,
+    # so the first layer reads three or four career-total columns
+    # and treats the other ~85 as noise.
+    ################################################################
+
+    if scale_features is None:
+        scale_features = data_cfg.get("scale_features", True)
+
+    scalers = fit_scalers(train_df) if scale_features else None
+
+    if scalers is None:
+        print(
+            "WARNING: scale_features is off -- raw career totals and "
+            "purses go straight into nn.Linear. See valuation_model/"
+            "scaling.py."
+        )
+
+    train_dataset = IPLAuctionDataset(train_df, encoder_manager, scalers=scalers)
+    val_dataset = IPLAuctionDataset(val_df, encoder_manager, scalers=scalers)
 
     train_loader = DataLoader(
         train_dataset,
@@ -388,42 +526,26 @@ def run_training_pipeline_with_holdout(
     # both come from build_training_df / build_training_samples.
     ################################################################
 
-    config["model"]["player_dim"] = len(
-        train_df.attrs["player_feature_columns"]
+    dims = _model_dims(train_df, encoder_manager)
+    config["model"].update(dims)
+
+    model = ValuationModel.from_config(config, dims)
+
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_rows = len(train_dataset)
+    n_informative = int(
+        (train_dataset.training_df["observation_type"] != "left").sum()
     )
 
-    config["model"]["team_state_dim"] = len(
-        train_df.attrs["team_state_columns"]
-    )
-
-    config["model"]["auction_state_dim"] = len(
-        train_df.attrs["auction_state_columns"]
-    )
-
-    config["model"]["num_role_features"] = len(
-        train_df.attrs["role_columns"]
-    )
-
-    config["model"]["num_teams"] = len(
-        encoder_manager.get_encoder("team").classes_
-    )
-
-    model = ValuationModel(
-        player_dim=config["model"]["player_dim"],
-        team_state_dim=config["model"]["team_state_dim"],
-        auction_state_dim=config["model"]["auction_state_dim"],
-        num_role_features=config["model"]["num_role_features"],
-        num_teams=config["model"]["num_teams"],
-        embedding_dim=config["model"]["embedding_dim"],
+    print(
+        f"model: {n_params:,} trainable parameters | "
+        f"{n_rows:,} training rows ({n_informative:,} non-left) | "
+        f"{n_params / max(n_informative, 1):.1f} params per informative row"
     )
 
     criterion = IntervalCensoredLoss()
 
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=config["training"]["learning_rate"],
-        weight_decay=config["training"]["weight_decay"],
-    )
+    optimizer = build_optimizer(model)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -435,8 +557,8 @@ def run_training_pipeline_with_holdout(
         criterion=criterion,
         optimizer=optimizer,
         device=device,
-        epochs=config["training"]["epochs"],
         valid_loader=val_loader,
+        **_train_kwargs(),
     )
 
     val_predictions = evaluate_predictions(

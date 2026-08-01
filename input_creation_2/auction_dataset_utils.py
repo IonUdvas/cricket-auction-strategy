@@ -264,9 +264,71 @@ def build_encoders(training_df):
 
     return manager
 
+####################################################################
+# Columns in player_role_df that must never become model features.
+#
+# These are not roles. They are player identity (a name, a date of
+# birth, the ball-by-ball name the matcher landed on) or bookkeeping
+# about the archetype table itself. One-hot expanding them, which is
+# what the `else` branch below used to do to any non-numeric column,
+# produced 3,409 of 3,467 "role" features -- an ~800-way one-hot
+# lookup on the player's own name, three more copies of it, and the
+# raw semicolon-joined tag string as a 222-way category on top of the
+# individual tags it is built from.
+#
+# That block is a memorisation channel, not a feature: a player with
+# two or three auctions in the whole dataset gets a private column
+# whose only job is to carry his training price. 65% of validation
+# rows land on a name column the model saw in training, which is
+# exactly the shape of a train loss that keeps falling (2.84 -> 2.28)
+# while validation loss more than doubles (2.68 -> 6.25).
+####################################################################
+
+ROLE_IDENTITY_COLUMNS = {
+    # Player identity, in four spellings.
+    "auction_name",
+    "cricbuzz_name",
+    "bbb_player",
+    "date_of_birth",
+    # The tag strings the individual boolean tag columns are parsed
+    # from. Keeping both double-counts every tag and adds a
+    # high-cardinality category for each distinct combination.
+    "archetypes",
+    "performance_archetypes",
+    # Bookkeeping about how the archetype table was built.
+    "match_method",
+}
+
+####################################################################
+# Columns computed ACROSS the whole archetype table, i.e. as of the
+# most recent auction in it, and therefore leaking the future into
+# every earlier auction's rows.
+#
+# `last_auction` and `n_auctions` say how long a player's IPL career
+# will turn out to run -- in a 2018 row, that is information from
+# 2026. `age_at_last_auction` is an age as of the wrong date.
+# `first_auction` is safe backwards but combines with the others.
+#
+# age is genuinely useful and date_of_birth is available; the right
+# fix is to compute it against each row's own auction date in
+# PlayerFeatureBuilder rather than to recover it from here.
+####################################################################
+
+ROLE_LEAKY_COLUMNS = {
+    "first_auction",
+    "last_auction",
+    "n_auctions",
+    "age_at_last_auction",
+}
+
+
 def build_role_table(
     training_df,
     player_role_df=None,
+    max_role_cardinality=24,
+    drop_identity_columns=True,
+    drop_leaky_columns=True,
+    verbose=True,
 ):
     """
     Build the player-role feature block as a numeric multi-hot table,
@@ -299,6 +361,29 @@ def build_role_table(
        one-hot encoded here so downstream code sees the exact same
        "numeric multi-hot block" shape either way -- no separate
        code path needed in the dataset or model for the legacy case.
+
+    Parameters
+    ----------
+    max_role_cardinality : int or None
+        A non-numeric column is one-hot expanded only if it has at
+        most this many distinct values. Above it, the column is a
+        near-unique key rather than a category and is dropped with a
+        warning. This is the general guard behind the specific
+        ROLE_IDENTITY_COLUMNS list: a new identity-like column added
+        to the archetype table later cannot silently reintroduce the
+        same failure. Set to None to disable (not recommended).
+    drop_identity_columns : bool
+        Drop ROLE_IDENTITY_COLUMNS -- player names and the raw tag
+        strings.
+    drop_leaky_columns : bool
+        Drop ROLE_LEAKY_COLUMNS -- fields computed as of the most
+        recent auction in the table rather than as of each row's own
+        auction date.
+    verbose : bool
+        Print what was dropped and the final block width. Worth
+        leaving on: the block silently going from ~50 to ~3,500
+        columns is the single most expensive thing that can happen
+        here and there is otherwise nothing that reports it.
     """
 
     ################################################################
@@ -352,6 +437,28 @@ def build_role_table(
         if drop_cols:
             role_df = role_df.drop(columns=drop_cols)
 
+        ############################################################
+        # Drop identity and as-of-wrong-date columns before anything
+        # decides how to encode them.
+        ############################################################
+
+        blocked = set()
+        if drop_identity_columns:
+            blocked |= ROLE_IDENTITY_COLUMNS
+        if drop_leaky_columns:
+            blocked |= ROLE_LEAKY_COLUMNS
+
+        blocked_present = sorted(blocked & set(role_df.columns))
+
+        if blocked_present:
+            role_df = role_df.drop(columns=blocked_present)
+            if verbose:
+                print(
+                    f"  build_role_table: dropped "
+                    f"{len(blocked_present)} identity/leaky columns: "
+                    f"{blocked_present}"
+                )
+
         tag_columns = [
             c for c in role_df.columns if c not in (merge_key, "playerName")
         ]
@@ -365,6 +472,7 @@ def build_role_table(
 
         numeric_frame = pd.DataFrame(index=role_df.index)
         role_columns = []
+        skipped_high_cardinality = []
 
         for col in tag_columns:
 
@@ -374,10 +482,39 @@ def build_role_table(
                 numeric_frame[col] = series.astype(float)
                 role_columns.append(col)
             else:
+                ####################################################
+                # A category worth one-hot encoding is one many
+                # players share (batting_style: 2 values,
+                # bowling_style: 10). A column with hundreds of
+                # distinct values across ~800 players is a key, and
+                # one-hot encoding a key gives the model a private
+                # column per player to memorise into. Refuse rather
+                # than expand.
+                ####################################################
+
+                n_unique = series.nunique(dropna=True)
+
+                if (
+                    max_role_cardinality is not None
+                    and n_unique > max_role_cardinality
+                ):
+                    skipped_high_cardinality.append((col, int(n_unique)))
+                    continue
+
                 dummies = pd.get_dummies(series, prefix=col, dummy_na=False)
                 dummies = dummies.astype(float)
                 numeric_frame = pd.concat([numeric_frame, dummies], axis=1)
                 role_columns.extend(dummies.columns.tolist())
+
+        if skipped_high_cardinality and verbose:
+            detail = ", ".join(
+                f"{c} ({n} distinct)" for c, n in skipped_high_cardinality
+            )
+            print(
+                f"  build_role_table: skipped {len(skipped_high_cardinality)} "
+                f"column(s) above max_role_cardinality="
+                f"{max_role_cardinality}: {detail}"
+            )
 
         role_df = pd.concat(
             [role_df[[merge_key]], numeric_frame], axis=1
@@ -397,6 +534,27 @@ def build_role_table(
         )
 
         role_frame = merged[role_columns].reset_index(drop=True)
+
+        ############################################################
+        # A player absent from the archetype table merges to all-NaN,
+        # which the dataset fills with 0 -- and an all-zero multi-hot
+        # is indistinguishable from "a player with no tags at all".
+        # An explicit flag lets the model tell "role unknown" from
+        # "role known to be nothing", the same way the player feature
+        # block already carries its *_is_missing flags.
+        ############################################################
+
+        role_missing = role_frame.isna().all(axis=1).astype(float)
+        role_frame = role_frame.copy()
+        role_frame["role_is_missing"] = role_missing
+        role_columns = role_columns + ["role_is_missing"]
+
+        if verbose:
+            print(
+                f"  build_role_table: {len(role_columns)} role features; "
+                f"{int(role_missing.sum())} of {len(role_frame)} rows "
+                f"unmatched in player_role_df"
+            )
 
         return role_frame, role_columns
 
