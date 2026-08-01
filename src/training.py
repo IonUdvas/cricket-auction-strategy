@@ -8,6 +8,7 @@ from input_creation_2.auction_dataset import IPLAuctionDataset
 from valuation_model.models import *
 from valuation_model.losses import *
 from valuation_model.training import *
+from valuation_model.scaling import fit_scalers
 from torch.utils.data import DataLoader
 
 import pandas as pd
@@ -152,7 +153,8 @@ def load_and_encode_data(full_training_df):
 
     dataset = IPLAuctionDataset(
         full_training_df,
-        encoder_manager
+        encoder_manager,
+        scalers=fit_scalers(full_training_df),
     )
 
     loader = DataLoader(
@@ -368,8 +370,19 @@ def run_training_pipeline_with_holdout(
     train_df.attrs["role_columns"] = role_columns 
     val_df.attrs["role_columns"] = role_columns
 
-    train_dataset = IPLAuctionDataset(train_df, encoder_manager)
-    val_dataset = IPLAuctionDataset(val_df, encoder_manager)
+    ################################################################
+    # Input scaling, fit on TRAIN ONLY.
+    #
+    # Unlike the encoder vocabulary above, this is a distributional
+    # fit, so fitting it on the train+val union would leak the
+    # validation year's feature distribution.  Both datasets share
+    # one scaler; val is transformed by train's statistics.
+    ################################################################
+
+    scalers = fit_scalers(train_df)
+
+    train_dataset = IPLAuctionDataset(train_df, encoder_manager, scalers=scalers)
+    val_dataset = IPLAuctionDataset(val_df, encoder_manager, scalers=scalers)
 
     train_loader = DataLoader(
         train_dataset,
@@ -455,5 +468,6 @@ def run_training_pipeline_with_holdout(
         "val_loader": val_loader,
         "train_df": train_df,
         "val_df": val_df,
+        "scalers": scalers,
         "val_predictions": val_predictions,
     }

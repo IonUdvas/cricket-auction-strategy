@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -66,7 +68,33 @@ class IntrinsicValuationNetwork(nn.Module):
         # everywhere (just small at the extremes), so there's always
         # some pull back toward the interior.
         self.sigma_min = 0.05
-        self.sigma_max = 3.0
+        # sigma is the standard deviation in LOG space, so 3.0 spans
+        # e^(6*3) ~= 6e7 across a 3-sigma band -- wide enough that a
+        # median of 279,497 still puts real mass on an actual sale at
+        # 1,575, and the interval likelihood barely notices.  That's
+        # the hedging escape hatch the sigmoid bounding was meant to
+        # close, just at a ceiling too high to close it: it shows up
+        # as within_3sigma_band ~= 0.94 sitting next to
+        # within_interval ~= 0.09.  1.5 still allows a ~8000x
+        # 3-sigma band, which is ample for auction prices spanning
+        # 30 lakh to 27 crore.
+        self.sigma_max = 1.5
+
+        ############################################################
+        # Anchor mu where prices actually live.
+        #
+        # With a zeroed final weight and the bias at log(typical
+        # price), the network starts by predicting the same sensible
+        # median for everyone and learns deviations from there,
+        # instead of starting at whatever a random projection of the
+        # feature block happens to produce and having to travel back.
+        ############################################################
+
+        nn.init.zeros_(self.mu_head.weight)
+        nn.init.constant_(self.mu_head.bias, math.log(50.0))
+
+        nn.init.zeros_(self.sigma_head.weight)
+        nn.init.zeros_(self.sigma_head.bias)
 
     def forward(
         self,
@@ -115,9 +143,36 @@ class AuctionAdjustmentNetwork(nn.Module):
             nn.Linear(128,64),
             nn.ReLU(),
 
-            nn.Linear(64,1)
-
         )
+
+        self.head = nn.Linear(64,1)
+
+        ############################################################
+        # log_phi is a *correction* to an intrinsic valuation, not a
+        # valuation in its own right.  Two changes enforce that.
+        #
+        # Zero init: the model starts at phi = 1 (no adjustment) and
+        # has to earn every departure from it.  Previously log_phi
+        # was a random projection of remaining_purse (0..12500) and
+        # auction_order (1..400), which at initialisation has a
+        # spread of hundreds of nats against a target range of about
+        # 12.5 -- so exp(mu + log_phi) was astronomically wrong
+        # before a single gradient step, and the first thing the
+        # optimiser had to do was spend its budget dragging this head
+        # back toward zero.
+        #
+        # tanh bound: caps the adjustment at e^1.5, i.e. phi in
+        # roughly [0.22, 4.5].  Team context can plausibly move a
+        # valuation by a factor of a few -- a team with a full purse
+        # and one slot left will overpay -- but not by a factor of
+        # 100, and leaving the head unbounded let it absorb the
+        # entire prediction instead of adjusting one.
+        ############################################################
+
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
+
+        self.max_log_phi = 1.5
 
     def forward(
         self,
@@ -130,7 +185,9 @@ class AuctionAdjustmentNetwork(nn.Module):
             dim=1
         )
 
-        log_phi = self.network(x)
+        log_phi = self.max_log_phi * torch.tanh(
+            self.head(self.network(x))
+        )
 
         return log_phi
 
@@ -185,8 +242,6 @@ class ValuationModel(nn.Module):
             auction_state
         )
     
-        mu_effective = mu + log_phi
-
         if not torch.isfinite(mu).all():
             raise RuntimeError("mu is NaN")
 

@@ -11,7 +11,15 @@ class IPLAuctionDataset(Dataset):
         self,
         training_df,
         encoder_manager,
+        scalers=None,
     ):
+        """
+        scalers : dict of BlockScaler, keyed by attrs group name, as
+                  returned by valuation_model.scaling.fit_scalers.
+                  Fit on the TRAIN frame and passed to both datasets.
+                  None keeps the old raw-feature behaviour, which is
+                  only ever right for a smoke test -- see scaling.py.
+        """
 
         self.training_df = training_df.copy()
 
@@ -58,36 +66,54 @@ class IPLAuctionDataset(Dataset):
         # Numerical Features
         ########################################################
 
+        self.scalers = scalers
+
+        def numeric_block(columns, scaler_key):
+            """
+            Scaled when a fitted scaler is supplied, raw otherwise.
+
+            Raw is kept only so an unscaled run stays reproducible for
+            comparison; it is not a supported training path.  The
+            feature blocks span career totals in the thousands,
+            purses up to 12500 and rates in [0, 1] all at once, and an
+            nn.Linear reads that as "the biggest column is the only
+            column".
+            """
+            if scalers is not None:
+                return scalers[scaler_key].transform(self.training_df)
+
+            fill = {
+                c: (1.0 if c.endswith("_is_missing") else 0.0)
+                for c in columns
+            }
+
+            return (
+                self.training_df[columns]
+                .fillna(fill)
+                .to_numpy(dtype=np.float32)
+            )
+
         self.player_features = torch.tensor(
-
-            self.training_df[
-                self.player_feature_columns
-            ]
-            .fillna(0)
-            .to_numpy(dtype=np.float32),
-
+            numeric_block(
+                self.player_feature_columns,
+                "player_feature_columns",
+            ),
             dtype=torch.float32,
         )
 
         self.team_state = torch.tensor(
-
-            self.training_df[
-                self.team_state_columns
-            ]
-            .fillna(0)
-            .to_numpy(dtype=np.float32),
-
+            numeric_block(
+                self.team_state_columns,
+                "team_state_columns",
+            ),
             dtype=torch.float32,
         )
 
         self.auction_state = torch.tensor(
-
-            self.training_df[
-                self.auction_state_columns
-            ]
-            .fillna(0)
-            .to_numpy(dtype=np.float32),
-
+            numeric_block(
+                self.auction_state_columns,
+                "auction_state_columns",
+            ),
             dtype=torch.float32,
         )
 
