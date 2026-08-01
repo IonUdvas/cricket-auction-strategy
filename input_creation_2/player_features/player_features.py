@@ -421,7 +421,13 @@ class PlayerStatsAggregator:
                 self._code_of[pid_] = len(self._vocab)
                 self._vocab.append(pid_)
 
-        player_code = f["fielder_id"].map(self._code_of).to_numpy().astype(np.int32)
+        # Restricting to `competitions` filters deliveries but not the fielding
+        # frame the caller handed us, so drop whole matches this view excludes.
+        # That is intended narrowing, not a data fault. It must happen before
+        # the codes below are built: every array from here on is positional.
+        f = f[f["match_id"].isin(set(d["match_id"].unique()))]
+        if len(f) == 0:
+            return None
 
         match_lookup = pd.DataFrame({
             "match_id": d["match_id"].to_numpy(),
@@ -430,6 +436,25 @@ class PlayerStatsAggregator:
             "match_date": c["dates"],
         }).drop_duplicates(["match_id", "innings"])
         f = f.merge(match_lookup, on=["match_id", "innings"], how="left")
+
+        # What is left is a fielding row in a match we kept but an innings with
+        # no deliveries. It merges to null, and astype(np.int32) on a null
+        # match_code yields INT_MIN rather than raising -- the catches survive,
+        # attached to a nonexistent match on a NaT date. Refuse rather than
+        # guess; the usual cause is super-overs dropped from deliveries but not
+        # from fielding.
+        unmatched = int(f["match_code"].isna().sum())
+        if unmatched:
+            sample = (f.loc[f["match_code"].isna(), ["match_id", "innings"]]
+                      .drop_duplicates().head(5).to_dict("records"))
+            raise ValueError(
+                f"{unmatched} fielding rows sit in a kept match but an innings "
+                f"with no deliveries, e.g. {sample}. deliveries and fielding "
+                f"were filtered inconsistently at build time; rebuild with "
+                f"data/build_bbb.py rather than dropping them here."
+            )
+
+        player_code = f["fielder_id"].map(self._code_of).to_numpy().astype(np.int32)
 
         kind = f["kind"].astype(str).str.lower().to_numpy()
         folded = self._fold(

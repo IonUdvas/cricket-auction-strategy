@@ -2,6 +2,7 @@ from input_creation_2.auction_dataset_utils import (
     build_training_samples,
     build_encoders,
     build_role_table,
+    PlayerFeatureContext,
 )
 from input_creation_2.auction_dataset import IPLAuctionDataset
 from valuation_model.models import *
@@ -12,7 +13,16 @@ from torch.utils.data import DataLoader
 import pandas as pd
 import yaml
 
-with open("/kaggle/working/cricket-auction-strategy/configs/default.yaml","r") as f:
+import os
+
+# Resolve relative to this file rather than a hardcoded Kaggle path, so the
+# module imports on a laptop, in CI and on Kaggle alike.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CONFIG_PATH = os.environ.get(
+    "CRICKET_CONFIG", os.path.join(REPO_ROOT, "configs", "default.yaml")
+)
+
+with open(CONFIG_PATH, "r") as f:
     config = yaml.safe_load(f)
 
 AUCTION_DATES = {
@@ -42,15 +52,17 @@ AUCTION_MAX_PURSES = {
 def build_training_df(
         player_template,
         bid_template,
-        bbb_parquet_PATH,
+        bbb_dir,
         years=None,
+        competitions=None,
+        overrides=None,
+        resolution=None,
 ):
     """
-    years : iterable of int, optional
-        Subset of AUCTION_DATES keys to build. Defaults to all years.
+    years   : iterable of int, optional. Defaults to all of AUCTION_DATES.
+    bbb_dir : directory holding deliveries/fielding/people parquet, as written
+              by data.build_bbb. Was previously a path to one parquet file.
     """
-
-    training_dfs = {}
 
     selected_years = (
         AUCTION_DATES
@@ -58,33 +70,53 @@ def build_training_df(
         else {y: AUCTION_DATES[y] for y in years}
     )
 
-    for year, auction_date in selected_years.items():
-
-        print(f"Building {year}...")
-
-        player_df_PATH = player_template.format(year=year)
-
-        bid_df_PATH = bid_template.format(year=year)
-
-        training_df = build_training_samples(
-            player_df_PATH,
-            bid_df_PATH,
-            bbb_parquet_PATH,
-            auction_date,
-            auction_max_purse = AUCTION_MAX_PURSES[year]
-        )
-
-        training_dfs[year] = training_df
-
-        print(
-            f"Finished {year}: "
-            f"{len(training_df)} training rows"
-        )
-
-    full_training_df = pd.concat(
-        training_dfs.values(),
-        ignore_index=True
+    # Built once, not once per year.
+    feature_context = PlayerFeatureContext(
+        bbb_dir,
+        competitions=competitions,
+        overrides=overrides,
+        resolution=resolution,
     )
+
+    # Identity is resolved across ALL years at once, before any year is built,
+    # so one playerId cannot become two different cricketers.
+    rosters = {
+        year: pd.read_csv(player_template.format(year=year))
+        for year in selected_years
+    }
+    feature_context.register_rosters(rosters)
+
+    training_dfs = {}
+    for year, auction_date in selected_years.items():
+        print(f"Building {year}...")
+        training_df = build_training_samples(
+            player_template.format(year=year),
+            bid_template.format(year=year),
+            feature_context,
+            auction_date,
+            auction_max_purse=AUCTION_MAX_PURSES[year],
+        )
+        training_dfs[year] = training_df
+        print(f"Finished {year}: {len(training_df)} training rows")
+
+    # pandas silently drops attrs to {} when concatenated frames disagree, and
+    # IPLAuctionDataset then dies with a bare KeyError far from the cause.
+    frames = list(training_dfs.values())
+    reference = dict(frames[0].attrs)
+    for year, frame in zip(selected_years, frames):
+        for key in ("player_feature_columns", "auction_state_columns",
+                    "team_state_columns", "bid_summary_columns"):
+            if frame.attrs.get(key) != reference.get(key):
+                a = set(reference.get(key, []))
+                b = set(frame.attrs.get(key, []))
+                raise ValueError(
+                    f"{year} disagrees with {list(selected_years)[0]} on "
+                    f"attrs[{key!r}]: only in first {sorted(a - b)}, "
+                    f"only in {year} {sorted(b - a)}"
+                )
+
+    full_training_df = pd.concat(training_dfs.values(), ignore_index=True)
+    full_training_df.attrs = reference
 
     return full_training_df
 
@@ -124,11 +156,18 @@ def run_training_pipeline(
         player_role_df=player_role_df,
     )
 
+    # pd.concat(axis=1) returns a NEW frame and does not carry .attrs across,
+    # so the column-group contract set in build_training_samples would be lost
+    # here and IPLAuctionDataset would fail on player_feature_columns. Capture
+    # and restore it explicitly.
+    _attrs = dict(full_training_df.attrs)
+
     full_training_df = pd.concat(
         [full_training_df.reset_index(drop=True), role_frame],
         axis=1,
     )
 
+    full_training_df.attrs = _attrs
     full_training_df.attrs["role_columns"] = role_columns
 
     encoder_manager, dataset, loader = load_and_encode_data(full_training_df)

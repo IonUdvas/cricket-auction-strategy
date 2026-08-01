@@ -26,7 +26,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from data_prep.build_bbb import build  # noqa: E402
+from data.build_bbb import build
 from input_creation_2.player_features.player_features import (  # noqa: E402
     PlayerFeatureBuilder,
     PlayerStatsAggregator,

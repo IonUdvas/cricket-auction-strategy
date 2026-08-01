@@ -1,6 +1,136 @@
+import os
+
 import pandas as pd
 from input_creation_2.player_features.player_features import PlayerStatsAggregator, PlayerFeatureBuilder
+from input_creation_2.player_features.identity import PlayerIdentityResolver
+from input_creation_2.player_features.squad_index import SquadIndex
 from input_creation_2.auction_replay_engine import AuctionReplayEngine
+
+
+class PlayerFeatureContext:
+    """
+    Owns everything that is shared across auction years: the ball-by-ball
+    aggregator, the feature flattener, and the auction-roster -> person_id
+    resolution map.
+
+    Two things drive this design.
+
+    First, the aggregator is as-of queryable, so it carries no year-specific
+    state; building it once instead of once per year removes eight redundant
+    passes over 2.4M deliveries.
+
+    Second, identity has to be resolved ONCE for all years together.  Resolving
+    per year lets the same auction playerId land on different people in
+    different years -- the roster spells "Shivam Dubey" one year and "Shivam
+    Dube" the next, and the name tiers answer differently.  A playerId is one
+    human being; that has to be true by construction, not by luck.
+    """
+
+    def __init__(self, bbb_dir, competitions=None, overrides=None,
+                 resolution=None, use_squads=True, verbose=True):
+        need = ("deliveries.parquet", "fielding.parquet", "people.parquet")
+        missing = [f for f in need if not os.path.exists(os.path.join(bbb_dir, f))]
+        if missing:
+            raise FileNotFoundError(
+                f"{bbb_dir} is missing {missing}. Build it with "
+                f"`python -m data.build_bbb --download --out-dir {bbb_dir}`."
+            )
+
+        deliveries = pd.read_parquet(os.path.join(bbb_dir, "deliveries.parquet"))
+        fielding = pd.read_parquet(os.path.join(bbb_dir, "fielding.parquet"))
+        people = pd.read_parquet(os.path.join(bbb_dir, "people.parquet"))
+
+        # `fielding=` is not optional in practice: without it every field_*
+        # column is silently zero for every player, which the model reads as
+        # "nobody ever took a catch" rather than "unknown".
+        self.aggregator = PlayerStatsAggregator(
+            deliveries, competitions=competitions, fielding=fielding
+        )
+        self.builder = PlayerFeatureBuilder(self.aggregator)
+        self.resolver = PlayerIdentityResolver(
+            people,
+            overrides=overrides,
+            resolution=resolution,
+            squad_index=SquadIndex(deliveries) if use_squads else None,
+        )
+        self.verbose = verbose
+        self.person_by_player = {}
+        self.identity_conflicts = []
+
+    def register_rosters(self, rosters):
+        """
+        rosters : {auction_year: player_df}
+
+        Resolve every roster row once, then collapse to one person_id per
+        playerId.  A playerId that resolves two different ways across years is
+        NOT silently majority-voted: the disagreement is itself evidence that
+        at least one match is wrong, so it is recorded and left unresolved.
+        """
+        frames = []
+        for year, df in rosters.items():
+            f = df[["playerId", "playerName", "playsForTeam"]].copy()
+            f["season_year"] = year
+            frames.append(f)
+        every = pd.concat(frames, ignore_index=True)
+
+        resolved = self.resolver.resolve(every)
+        got = resolved.dropna(subset=["person_id"])
+
+        for pid_, grp in got.groupby("playerId"):
+            people_hit = set(grp["person_id"])
+            if len(people_hit) == 1:
+                self.person_by_player[pid_] = next(iter(people_hit))
+            else:
+                self.identity_conflicts.append(
+                    (pid_, grp["playerName"].iloc[0], sorted(people_hit))
+                )
+
+        if self.verbose:
+            n_ids = every["playerId"].nunique()
+            print(f"identity: {len(self.person_by_player)}/{n_ids} distinct "
+                  f"playerIds resolved "
+                  f"({len(self.person_by_player) / n_ids:.1%})")
+            if self.identity_conflicts:
+                print(f"  {len(self.identity_conflicts)} playerIds resolved "
+                      f"inconsistently across years and were left unresolved:")
+                for pid_, name, hits in self.identity_conflicts[:10]:
+                    print(f"    {name!r} (id {pid_}) -> {hits}")
+            if self.resolver.cache_misses:
+                print(f"  {len(self.resolver.cache_misses)} cached cricinfo ids "
+                      f"have no T20 ball data")
+        return self.person_by_player
+
+    def features_for(self, player_df, auction_date):
+        """
+        One feature row per auction `playerId`, as of `auction_date`.
+
+        Deliberately not `build_feature_table`: that keys on and de-duplicates
+        by person_id, and every unresolved player has person_id = None, so
+        merging back onto playerId would collapse them into a single row and
+        then match none of them, because null never equals null in a join.
+        Flattening per roster row keeps the frame keyed on playerId, which is
+        what the training rows actually carry.
+        """
+        roster = player_df[["playerId"]].drop_duplicates()
+        rows = [
+            self.builder.flatten(
+                self.aggregator.get_player_stats(
+                    self.person_by_player.get(pid_), auction_date
+                )
+            )
+            for pid_ in roster["playerId"]
+        ]
+        features = pd.DataFrame(rows)
+        features.insert(0, "playerId", roster["playerId"].to_numpy())
+
+        assert len(features) == len(roster), "feature table lost or gained rows"
+        assert features["playerId"].is_unique, "duplicate playerId in features"
+        return features
+
+    @staticmethod
+    def feature_column_names(features):
+        """The numeric block only -- never the join keys."""
+        return [c for c in features.columns if c not in ("playerId", "playerName")]
 
 class LabelEncoder:
 
@@ -266,7 +396,7 @@ def build_role_table(
 def build_training_samples(
     player_df_PATH,
     bid_df_PATH,
-    bbb_data_parquet_PATH,
+    feature_context,
     auction_date,
     auction_max_purse,
 ):
@@ -291,24 +421,6 @@ def build_training_samples(
     once, after all years are concatenated together, by
     build_training_df / run_training_pipeline_with_holdout.
     """
-
-    ############################################################
-    # Load historical cricket data
-    ############################################################
-
-    bbb_data_df = (
-        pd.read_parquet(bbb_data_parquet_PATH)
-        .sort_values("match_date")
-        .reset_index(drop=True)
-    )
-
-    ############################################################
-    # Feature Builder
-    ############################################################
-
-    player_feature_builder = PlayerFeatureBuilder(
-        PlayerStatsAggregator(bbb_data_df)
-    )
 
     ############################################################
     # Load auction data
@@ -342,8 +454,12 @@ def build_training_samples(
     # Player Features
     ############################################################
 
-    player_features = player_feature_builder.build_feature_table(
-        player_df[["playerId", "playerName"]],
+    # The roster's Cricbuzz playerId is NOT the ball data's Cricsheet
+    # person_id.  features_for() goes through the resolved identity map;
+    # passing playerId straight to the aggregator (the old behaviour) gave
+    # every single player an empty career.
+    player_features = feature_context.features_for(
+        player_df,
         auction_date,
     )
 
@@ -354,7 +470,7 @@ def build_training_samples(
 
     before = len(training_df)
     training_df = training_df.merge(
-        player_features.drop(columns=["playerName"]),
+        player_features,
         on="playerId",
         how="left",
         validate="many_to_one",     # <-- crashes instead of silently fanning out
@@ -406,11 +522,12 @@ def build_training_samples(
         "role",
     }
 
-    training_df.attrs["player_feature_columns"] = [
-        c
-        for c in player_features.columns
-        if c != "playerName"
-    ]
+    # The id column must not leak into the feature block: this used to filter
+    # out only "playerName", leaving the raw Cricbuzz playerId to be cast to
+    # float32 and fed to the model as a numeric feature.
+    training_df.attrs["player_feature_columns"] = (
+        PlayerFeatureContext.feature_column_names(player_features)
+    )
 
     training_df.attrs["auction_state_columns"] = [
         c
