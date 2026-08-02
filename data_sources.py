@@ -477,43 +477,66 @@ def earnings_template(required=False):
 
 # --- cricsheet source json -------------------------------------------------
 
+CRICSHEET_ZIP_GLOB = "*_json.zip"
+
+
 def cricsheet_sources(required=True):
     """
-    Everything build_bbb should read, from the `inputs` dataset.
+    Everything build_bbb should read: the Cricsheet match archives.
 
-    Returns a list of paths: the 20 `*_json.zip` archives under
-    `cricsheet/`, or -- if you ever upload them unzipped instead --
-    the directories of match json.  `iter_match_documents` accepts both,
-    so nothing has to be extracted into the session first.
+    Resolution is by FILE, not by directory name. That is deliberate, and two
+    separate incidents are why:
+
+      1. A directory called `cricsheet` can exist and be empty. build_bbb used
+         to call `output_dir("cricsheet")` before resolving its sources, which
+         CREATED /kaggle/working/cricsheet -- and since /kaggle/working is
+         searched first, that empty directory won and the build died claiming
+         the dataset was not attached. Same failure as the empty `bbb`
+         decoy, which is guarded by `contains=`.
+
+      2. `kaggle datasets create --dir-mode zip` uploads each folder as a zip
+         and Kaggle unpacks it into a folder of the same name, so `cricsheet/`
+         arrives as `cricsheet/cricsheet/`. Anything that assumed a fixed
+         depth broke on a perfectly valid upload.
+
+    So: walk the inputs dataset and take every `*_json.zip` found, wherever it
+    sits. There is nothing else in that dataset matching this pattern, and a
+    file that exists cannot be an empty decoy.
 
     people.csv is deliberately NOT returned here: it is the register, not a
-    match source, and it is fetched separately by `people_register()`.
+    match source, and `people_register()` fetches it separately.
 
-    Why the zips rather than the Hawkeye dataset's unzipped copy: this
-    snapshot is newer. It carries Major League Tournament (134 matches, absent
-    there entirely) and several hundred more recent matches across t20s, t20
-    blast, MLC and LPL. Building from the older copy silently produces a
-    smaller delivery table with no error anywhere.
+    Why these zips and not the Hawkeye dataset's unzipped copy: this snapshot
+    is newer. It carries Major League Tournament (134 matches, absent there
+    entirely) and several hundred more recent matches across t20s, t20 blast,
+    MLC and LPL. Building from the older copy silently produces a smaller
+    delivery table with no error anywhere.
     """
-    root = find_dir("cricsheet", required=required, dataset="inputs")
+    root = dataset_root("inputs", required=required)
     if not root:
         return []
 
-    zips = sorted(glob.glob(os.path.join(root, "*_json.zip")))
-    if zips:
-        return zips
-
-    # Fallback: an unzipped upload. Any directory holding match json.
-    dirs = []
+    zips = []
     for dirpath, _, filenames in _walk(root):
-        if any(f.endswith(".json") and f != "README.json" for f in filenames):
-            dirs.append(dirpath)
+        zips.extend(os.path.join(dirpath, f) for f in filenames
+                    if f.endswith("_json.zip"))
+    if zips:
+        # Sorted by basename so the read order does not depend on how deeply
+        # the upload happened to nest them.
+        return sorted(zips, key=os.path.basename)
+
+    # Fallback: an unzipped upload -- directories of match json.
+    dirs = [dirpath for dirpath, _, filenames in _walk(root)
+            if any(f.endswith(".json") and f != "README.json"
+                   for f in filenames)]
     if dirs:
         return sorted(dirs)
 
     if required:
         raise DataNotFound(
-            f"{root} holds no *_json.zip and no directory of match json."
+            f"found the inputs dataset at {root}, but it holds no "
+            f"{CRICSHEET_ZIP_GLOB} and no directory of match json.\n"
+            f"Expected 20 archives such as ipl_male_json.zip."
             + _attach_hint("inputs")
         )
     return []
@@ -708,8 +731,8 @@ def describe():
         srcs = cricsheet_sources(required=False)
     except Exception:  # noqa: BLE001
         srcs = []
-    print(f"  {'cricsheet sources':22s} {len(srcs)} files "
-          f"(expect 20 zips)")
+    flag = "" if len(srcs) == 20 else "   <-- EXPECTED 20"
+    print(f"  {'cricsheet sources':22s} {len(srcs)} files{flag}")
 
     if not bbb_dir(required=False):
         print("\nbbb is NOT built in this session. Run:\n"

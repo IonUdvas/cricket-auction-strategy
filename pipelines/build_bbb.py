@@ -747,14 +747,21 @@ def main(argv=None):
     import data_sources as ds
 
     out_dir = args.out_dir or ds.output_dir("bbb")
-    raw_dir = args.raw_dir or ds.output_dir("cricsheet")
+
+    # raw_dir is resolved LAZILY, inside the --download branch below.
+    # output_dir() creates the directory it returns, and calling it here
+    # created an empty /kaggle/working/cricsheet on every run -- which then
+    # shadowed the real dataset, because /kaggle/working is searched first.
+    # An unconditional call to a function with a side effect, used by a branch
+    # that usually does not run.
 
     paths = []
     for pattern in args.zips:
         paths.extend(sorted(glob.glob(pattern)) or [pattern])
 
     if args.download:
-        print("Downloading Cricsheet sources:")
+        raw_dir = args.raw_dir or ds.output_dir("cricsheet_download")
+        print(f"Downloading Cricsheet sources to {raw_dir}:")
         paths.extend(download_sources(raw_dir,
                                       include_optional=args.include_hundred))
 
