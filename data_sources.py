@@ -174,30 +174,105 @@ def output_dir(subdir=None):
     return path
 
 
+def _csv_options():
+    """
+    Explicit CSV dialect, so nothing depends on the sniffer guessing right.
+
+    DuckDB auto-detects delimiter, quote and escape by searching a candidate
+    space, and when that search fails on a multi-file read it raises
+    `Error when sniffing file ""` -- with an empty filename, because the
+    multi-file reader does not know which of the files it was working on.
+    That is unactionable.  These files are ordinary comma-separated exports,
+    so the dialect is simply stated and there is no search to fail.
+
+    `sample_size` is deliberately left at the default.  An earlier version
+    forced -1 to stop sparse columns being typed as all-NULL, but a full-file
+    check showed the default sniffer already recovers every one of the
+    1,069,790 `control` values, and -1 makes the sniffer scan the whole file
+    before reading a row of it.
+
+    `null_padding` is deliberately NOT set.  It looks like free robustness
+    against ragged rows, and DuckDB's own error message recommends it, but it
+    is rejected by the parallel scanner whenever a file contains a newline
+    inside a quoted field -- which these do, in the commentary text columns.
+    Setting it turns a file that reads fine into `CSV Error on Line: 1807`.
+    """
+    opts = [
+        "header=true",
+        "delim=','",
+        "quote='\"'",
+        "escape='\"'",
+    ]
+    if _duckdb_at_least(1, 2):
+        # Tolerates rows that do not strictly comply with RFC 4180 --
+        # unescaped quotes mid-field, which hand-assembled exports collect.
+        opts.append("strict_mode=false")
+    return ", ".join(opts)
+
+
+def _duckdb_at_least(major, minor):
+    try:
+        import duckdb
+        parts = duckdb.__version__.split(".")
+        return (int(parts[0]), int(parts[1])) >= (major, minor)
+    except Exception:
+        return False
+
+
 def scan(path, csv_kwargs=None):
     """
     A DuckDB table expression for `path`, whatever its format.
 
-    CSV is read with sample_size=-1: DuckDB infers column types from a sample
-    by default, and in this feed the sparse columns (`control`, `elevation`,
-    the wagon-wheel coordinates) are empty for long stretches, so a sampled
-    inference can type a whole column as NULL and silently drop every value in
-    it.  Reading the file twice is worth not losing the columns this pipeline
-    exists to extract.
+    A list is expanded into one read per file combined with UNION ALL BY NAME
+    rather than handed to `read_csv([...])`.  It costs nothing and it means a
+    failure names the file that caused it instead of reporting `""`.
     """
     if isinstance(path, (list, tuple)):
-        inner = ", ".join(f"'{p}'" for p in path)
-        if all(str(p).endswith(".parquet") for p in path):
-            return f"read_parquet([{inner}])"
-        return f"read_csv([{inner}], sample_size=-1, union_by_name=true)"
+        parts = [f"SELECT * FROM {scan(p, csv_kwargs)}" for p in path]
+        return "(" + " UNION ALL BY NAME ".join(parts) + ")"
 
     p = str(path)
     if p.endswith(".parquet"):
         return f"read_parquet('{p}')"
-    opts = "sample_size=-1"
+    opts = _csv_options()
     if csv_kwargs:
         opts += ", " + ", ".join(f"{k}={v}" for k, v in csv_kwargs.items())
     return f"read_csv('{p}', {opts})"
+
+
+def probe(path, con=None, min_columns=10):
+    """
+    Try to read one file's header and first rows.
+
+    Returns (ok, message).  Run this over each input before a long build: a
+    dialect failure surfaces here, named, in a second, instead of thirty
+    seconds into stage 1 with an empty filename attached to it.
+    """
+    import duckdb
+    con = con or duckdb.connect()
+    try:
+        rel = con.sql(f"SELECT * FROM {scan(path)} LIMIT 5")
+        cols = len(rel.columns)
+        # count(*) over the sample rather than fetching it: pulling real
+        # values into Python drags in the timestamp conversion path, and a
+        # probe that fails because pytz is missing tells you nothing about
+        # the file.
+        n = con.sql(
+            f"SELECT count(*) FROM (SELECT * FROM {scan(path)} LIMIT 5)"
+        ).fetchone()[0]
+        # A file whose dialect was misread does not raise -- it parses as one
+        # giant column. That is the failure mode worth catching, because it
+        # survives all the way to a confusing join error much later.
+        if cols < min_columns:
+            return False, (f"MISPARSED: {cols} column(s), expected at least "
+                           f"{min_columns} -- wrong delimiter or encoding")
+        if n == 0:
+            return False, f"EMPTY: {cols} columns but no rows"
+        return True, f"ok: {cols} columns, read {n} sample rows"
+    except Exception as exc:
+        first = str(exc).strip().split("\n")[0]
+        return False, f"UNREADABLE: {first}"
+
 
 
 def describe():
