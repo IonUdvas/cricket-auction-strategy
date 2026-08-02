@@ -5,6 +5,7 @@ import pandas as pd
 from input_creation_2.player_features.player_features import PlayerStatsAggregator, PlayerFeatureBuilder
 from input_creation_2.player_features.identity import PlayerIdentityResolver
 from input_creation_2.player_features.squad_index import SquadIndex
+from input_creation_2.player_features.delivery_loader import load_deliveries
 from input_creation_2.auction_replay_engine import AuctionReplayEngine
 
 
@@ -47,7 +48,12 @@ class PlayerFeatureContext:
                 f"`python -m data.build_bbb --download --out-dir {bbb_dir}`."
             )
 
-        deliveries = pd.read_parquet(os.path.join(bbb_dir, "deliveries.parquet"))
+        # load_deliveries, not read_parquet: it merges ball_attributes
+        # (control / false shot / elevation) onto the frame when that file
+        # can be found. Reading the parquet directly here is what kept the
+        # shot-quality metrics at None all the way through training even
+        # after the aggregator learned to compute them.
+        deliveries = load_deliveries(bbb_dir)
         fielding = pd.read_parquet(os.path.join(bbb_dir, "fielding.parquet"))
         people = pd.read_parquet(os.path.join(bbb_dir, "people.parquet"))
 

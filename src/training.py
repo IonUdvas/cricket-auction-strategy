@@ -18,6 +18,10 @@ import yaml
 
 import os
 import random
+import sys
+
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 # Resolve relative to this file rather than a hardcoded Kaggle path, so the
 # module imports on a laptop, in CI and on Kaggle alike.
@@ -131,6 +135,22 @@ def _train_kwargs(cfg=None):
 # (deliveries / fielding / people / wickets / matches), not the single flat
 # parquet this pipeline used to take.  Defaulting to the repo's own copy means
 # a caller never has to know that.
+# Resolved lazily rather than at import: on Kaggle the repo is cloned before
+# the datasets are guaranteed to be mounted, and a module-level path would
+# freeze whatever was (not) visible at import time.
+def default_bbb_dir():
+    import data_sources as ds
+    return ds.bbb_dir()
+
+
+def default_resolution():
+    import data_sources as ds
+    return ds.find_file("cricinfo_resolution.csv", required=False) or \
+        os.path.join(REPO_ROOT, "data", "identity", "cricinfo_resolution.csv")
+
+
+# Back-compat: existing callers read these names directly. They fall back to
+# the in-repo copy when nothing is mounted, which is the old behaviour.
 DEFAULT_BBB_DIR = os.path.join(REPO_ROOT, "data", "bbb")
 DEFAULT_RESOLUTION = os.path.join(
     REPO_ROOT, "data", "identity", "cricinfo_resolution.csv"
@@ -199,9 +219,9 @@ def build_training_df(
                  "behind a config flag" in that comment was not true.
     """
     if bbb_dir is None:
-        bbb_dir = DEFAULT_BBB_DIR
+        bbb_dir = default_bbb_dir()
     if resolution is None and os.path.exists(DEFAULT_RESOLUTION):
-        resolution = DEFAULT_RESOLUTION
+        resolution = default_resolution()
 
     selected_years = (
         AUCTION_DATES
@@ -420,9 +440,9 @@ def run_training_pipeline_with_holdout(
         print(f"seed: {seed}")
 
     if bbb_dir is None:
-        bbb_dir = DEFAULT_BBB_DIR
+        bbb_dir = default_bbb_dir()
     if resolution is None and os.path.exists(DEFAULT_RESOLUTION):
-        resolution = DEFAULT_RESOLUTION
+        resolution = default_resolution()
 
     feature_context = PlayerFeatureContext(
         bbb_dir,

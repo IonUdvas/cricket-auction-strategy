@@ -29,28 +29,47 @@ ATTRIBUTE_COLUMNS = (
 KEYS = ("match_id", "innings", "ball_seq")
 
 
-def load_deliveries(bbb_dir="data/bbb", with_shot_quality=True, columns=None):
+def load_deliveries(bbb_dir=None, with_shot_quality=True, columns=None,
+                    attributes_path=None):
     """
     Parameters
     ----------
-    bbb_dir : str
-        Directory holding deliveries.parquet and ball_attributes.parquet.
+    bbb_dir : str, optional
+        Directory holding deliveries.parquet.  Resolved via `data_sources`
+        when omitted, which finds it under /kaggle/input or in the repo.
     with_shot_quality : bool
-        Merge ball_attributes if it exists.  When it does not, this is a
+        Merge ball_attributes if it can be found.  When it cannot, this is a
         no-op and the caller gets the plain delivery table -- the aggregator
         degrades to `None` for every shot-quality metric rather than
         inventing zeros.
     columns : list of str, optional
         Restrict the delivery columns read.  The aggregator's required set
         plus the merge keys must be included.
+    attributes_path : str, optional
+        Explicit path to ball_attributes.parquet.  It is resolved separately
+        from `bbb_dir` because it is *built* rather than downloaded, so on
+        Kaggle it usually arrives as its own dataset while deliveries comes
+        from the original bbb one.  Assuming the two live together is the
+        obvious shortcut and it silently drops shot quality on exactly the
+        setup this pipeline runs in.
     """
+    import sys
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+    if repo not in sys.path:
+        sys.path.insert(0, repo)
+    import data_sources as ds
+
+    bbb_dir = bbb_dir or ds.bbb_dir()
     deliveries = pd.read_parquet(
         os.path.join(bbb_dir, "deliveries.parquet"), columns=columns)
     if not with_shot_quality:
         return deliveries
 
-    path = os.path.join(bbb_dir, "ball_attributes.parquet")
+    path = attributes_path or os.path.join(bbb_dir, "ball_attributes.parquet")
     if not os.path.exists(path):
+        path = ds.find_file("ball_attributes.parquet", required=False)
+    if not path:
         return deliveries
 
     attrs = pd.read_parquet(path, columns=list(KEYS) + list(ATTRIBUTE_COLUMNS))
