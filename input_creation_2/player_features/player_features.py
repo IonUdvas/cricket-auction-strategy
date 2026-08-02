@@ -57,6 +57,42 @@ class _AsOfIndex:
         k = int(np.searchsorted(self.dates, ts, side="left"))
         return {q: float(arr[k]) for q, arr in self.cum.items()}
 
+    def window(self, ts, n_matches, match_key="new_match"):
+        """
+        Totals over the player's most recent `n_matches` matches before `ts`.
+
+        Recent form is a trailing window, not a career total, and the window
+        has to be counted in *matches* rather than innings: a bowler who did
+        not bat in three of his last twenty games has seventeen batting
+        innings in those twenty matches, and counting innings would silently
+        reach back an extra three games for him and not for an opener.
+
+        `cum[match_key]` is the running distinct-match count, so the start of
+        the window is the first innings whose running count exceeds
+        (matches_so_far - n_matches).  That is one searchsorted on an array
+        that is monotone by construction, and the subtraction of two prefix
+        sums is exact -- no re-summing, no slicing.
+        """
+        k = int(np.searchsorted(self.dates, ts, side="left"))
+        if k == 0:
+            return {q: 0.0 for q in self.cum}
+        counts = self.cum[match_key]
+        target = counts[k] - n_matches
+        if target <= 0:
+            return {q: float(arr[k]) for q, arr in self.cum.items()}
+        # counts is non-decreasing; the window opens at the first innings
+        # belonging to the (target+1)-th match.
+        start = int(np.searchsorted(counts[: k + 1], target, side="right")) - 1
+        start = max(start, 0)
+        return {q: float(arr[k] - arr[start]) for q, arr in self.cum.items()}
+
+    def since(self, ts, from_ts):
+        """Totals over [from_ts, ts) -- e.g. one named season."""
+        k = int(np.searchsorted(self.dates, ts, side="left"))
+        j = int(np.searchsorted(self.dates, from_ts, side="left"))
+        j = min(j, k)
+        return {q: float(arr[k] - arr[j]) for q, arr in self.cum.items()}
+
     @property
     def empty_totals(self):
         return {q: 0.0 for q in self.cum}
@@ -112,6 +148,16 @@ BAT_QUANTITIES = (
     "runs_powerplay", "balls_powerplay",
     "runs_middle", "balls_middle",
     "runs_death", "balls_death",
+    # Boundaries split by phase.  Overall boundary% conflates a powerplay
+    # opener with a death hitter; the split is what separates them.
+    "boundaries_powerplay", "boundaries_middle", "boundaries_death",
+    # Shot quality, from ball_attributes.parquet.  Each rate carries its own
+    # denominator because coverage is partial and era-dependent: control runs
+    # IPL 2015-2025 but elevation only 2019-2024, so a player's control and
+    # aerial numbers are NOT computed over the same balls and a shared
+    # denominator would quietly misstate both.
+    "control_balls", "controlled",
+    "elev_balls", "aerial",
 )
 
 BOWL_QUANTITIES = (
@@ -120,6 +166,12 @@ BOWL_QUANTITIES = (
     "balls_powerplay", "runs_powerplay", "wickets_powerplay",
     "balls_middle", "runs_middle", "wickets_middle",
     "balls_death", "runs_death", "wickets_death",
+    "boundaries_conceded_powerplay", "boundaries_conceded_middle",
+    "boundaries_conceded_death",
+    # A bowler's false-shot rate is the mirror of the batter's control rate:
+    # the same ball, scored from the other end.
+    "control_balls", "false_shots",
+    "elev_balls", "aerial_conceded",
 )
 
 FIELD_QUANTITIES = ("catches", "stumpings", "run_out_involvements")
@@ -275,23 +327,54 @@ class PlayerStatsAggregator:
             out[name] = np.bincount(codes, weights=values, minlength=ng)
         return pd.DataFrame(out)
 
+    @staticmethod
+    def _optional(d, column, n):
+        """
+        A ball_attributes column, or zeros when it was never merged in.
+
+        Shot quality is an *enrichment*: the aggregator has to keep working on
+        a bare build_bbb delivery frame, and it has to give the same answers
+        it always did on one.  A missing column therefore contributes zero to
+        both numerator and denominator, which makes every derived rate `None`
+        rather than a fabricated 0.0.
+        """
+        if column not in d.columns:
+            return np.zeros(n, dtype=np.float64)
+        return d[column].to_numpy(dtype=np.float64, na_value=0.0)
+
     @classmethod
     def _fold_batting(cls, d, c):
         phase = c["phase"]
+        n = len(d)
         runs = d["runs_batter"].to_numpy(dtype=np.float64)
         balls = d["ball_faced"].to_numpy().astype(np.float64)
+        fours = d["is_four"].to_numpy().astype(np.float64)
+        sixes = d["is_six"].to_numpy().astype(np.float64)
+
+        # `has_control` / `has_elevation` are the coverage flags written by
+        # build_shot_attributes; they are the denominators, and they are not
+        # interchangeable (see BAT_QUANTITIES).
+        ctrl_den = cls._optional(d, "has_control", n)
+        ctrl_num = cls._optional(d, "is_controlled_wide", n) * ctrl_den
+        elev_den = cls._optional(d, "has_elevation", n)
+        elev_num = cls._optional(d, "is_aerial", n) * elev_den
 
         q = {
             "runs": runs,
             "balls": balls,
-            "fours": d["is_four"].to_numpy().astype(np.float64),
-            "sixes": d["is_six"].to_numpy().astype(np.float64),
+            "fours": fours,
+            "sixes": sixes,
             "dots": d["is_dot_batter"].to_numpy().astype(np.float64),
+            "control_balls": ctrl_den,
+            "controlled": ctrl_num,
+            "elev_balls": elev_den,
+            "aerial": elev_num,
         }
         for ph in PHASES:
             m = (phase == ph).astype(np.float64)
             q[f"runs_{ph}"] = runs * m
             q[f"balls_{ph}"] = balls * m
+            q[f"boundaries_{ph}"] = (fours + sixes) * m
 
         striker = c["striker_id"]
         valid = striker >= 0
@@ -352,6 +435,19 @@ class PlayerStatsAggregator:
             & ((d["byes"].to_numpy() + d["legbyes"].to_numpy()) == 0)
         ).astype(np.float64)
 
+        n = len(d)
+        boundaries = (
+            d["is_four"].to_numpy().astype(np.float64)
+            + d["is_six"].to_numpy().astype(np.float64)
+        )
+        ctrl_den = cls._optional(d, "has_control", n)
+        # False shot is the complement of control on the balls where a
+        # judgement exists -- not `1 - rate`, which would count every
+        # unjudged ball as a false shot.
+        false_num = (1.0 - cls._optional(d, "is_controlled_wide", n)) * ctrl_den
+        elev_den = cls._optional(d, "has_elevation", n)
+        elev_num = cls._optional(d, "is_aerial", n) * elev_den
+
         q = {
             "balls": legal,
             "runs": runs,
@@ -359,12 +455,17 @@ class PlayerStatsAggregator:
             "dots": dots,
             "wides": d["wides"].to_numpy(dtype=np.float64),
             "noballs": d["noballs"].to_numpy(dtype=np.float64),
+            "control_balls": ctrl_den,
+            "false_shots": false_num,
+            "elev_balls": elev_den,
+            "aerial_conceded": elev_num,
         }
         for ph in PHASES:
             m = (phase == ph).astype(np.float64)
             q[f"balls_{ph}"] = legal * m
             q[f"runs_{ph}"] = runs * m
             q[f"wickets_{ph}"] = wkts * m
+            q[f"boundaries_conceded_{ph}"] = boundaries * m
 
         bowler = c["bowler_id"]
         valid = bowler >= 0
@@ -477,16 +578,22 @@ class PlayerStatsAggregator:
     def known_players(self):
         return set(self._first_seen)
 
-    def get_player_stats(self, player_id, as_of_date):
+    def get_player_stats(self, player_id, as_of_date, recent_matches=20):
         """
         Career totals and derived metrics for `player_id` strictly *before*
-        `as_of_date`.
+        `as_of_date`, plus the same metrics over the player's most recent
+        `recent_matches` matches.
 
         Returns a nested dict.  Metrics that are undefined for the player's
         record (average with no dismissals, economy with no balls) are `None`.
+
+        The `recent` block answers a different question from the career block
+        and the auction cares more about it: a 34-year-old with a great career
+        and a bad last season is priced on the last season.  Set
+        `recent_matches=None` to skip it.
         """
         stamp = pd.Timestamp(as_of_date)
-        key = (player_id, stamp)
+        key = (player_id, stamp, recent_matches)
         if key in self._cache:
             return self._cache[key]
 
@@ -519,6 +626,22 @@ class PlayerStatsAggregator:
             "bowling": {"raw": _as_int(bowl), "metrics": _bowling_metrics(bowl)},
             "fielding": _as_int(field),
         }
+
+        if recent_matches:
+            r_bat = (bat_idx.window(ts, recent_matches) if bat_idx
+                     else {q: 0.0 for q in BAT_QUANTITIES})
+            r_bowl = (bowl_idx.window(ts, recent_matches) if bowl_idx
+                      else {q: 0.0 for q in BOWL_QUANTITIES})
+            result["recent"] = {
+                "window_matches": recent_matches,
+                "batting_matches": int(r_bat["new_match"]),
+                "bowling_matches": int(r_bowl["new_match"]),
+                "batting": {"raw": _as_int(r_bat),
+                            "metrics": _batting_metrics(r_bat)},
+                "bowling": {"raw": _as_int(r_bowl),
+                            "metrics": _bowling_metrics(r_bowl)},
+            }
+
         self._cache[key] = result
         return result
 
@@ -552,10 +675,24 @@ def _batting_metrics(b):
         "dot_ball_percentage": _ratio(b["dots"], b["balls"]),
         "balls_per_dismissal": _ratio(b["balls"], b["outs"]),
         "runs_per_innings": _ratio(b["runs"], b["innings"]),
+        # Control is the batter-side shot-quality measure; false shot % is
+        # its complement and is reported for bowlers.  Both are `None` until
+        # the player has a ball with a control judgement on it, which for the
+        # IPL means 2015 onwards and for most other leagues means never.
+        "control_percentage": _ratio(b["controlled"], b["control_balls"]),
+        "false_shot_percentage": _ratio(
+            b["control_balls"] - b["controlled"], b["control_balls"]),
+        # Share of *shots actually made* that went in the air.  The
+        # denominator excludes plays-and-misses, leaves and hit-pads; see
+        # data/build_shot_attributes.py.
+        "aerial_percentage": _ratio(b["aerial"], b["elev_balls"]),
     }
     for ph in PHASES:
         m[f"strike_rate_{ph}"] = _ratio(b[f"runs_{ph}"], b[f"balls_{ph}"], 100.0)
         m[f"balls_share_{ph}"] = _ratio(b[f"balls_{ph}"], b["balls"])
+        m[f"runs_{ph}"] = b[f"runs_{ph}"]
+        m[f"boundary_percentage_{ph}"] = _ratio(
+            b[f"boundaries_{ph}"], b[f"balls_{ph}"])
     return m
 
 
@@ -567,11 +704,18 @@ def _bowling_metrics(b):
         "dot_ball_percentage": _ratio(b["dots"], b["balls"]),
         "wickets_per_innings": _ratio(b["wickets"], b["innings"]),
         "extras_per_ball": _ratio(b["wides"] + b["noballs"], b["balls"]),
+        "false_shot_percentage": _ratio(b["false_shots"], b["control_balls"]),
+        "control_conceded_percentage": _ratio(
+            b["control_balls"] - b["false_shots"], b["control_balls"]),
+        "aerial_conceded_percentage": _ratio(b["aerial_conceded"], b["elev_balls"]),
     }
     for ph in PHASES:
         m[f"economy_{ph}"] = _ratio(b[f"runs_{ph}"], b[f"balls_{ph}"], 6.0)
         m[f"balls_share_{ph}"] = _ratio(b[f"balls_{ph}"], b["balls"])
         m[f"strike_rate_{ph}"] = _ratio(b[f"balls_{ph}"], b[f"wickets_{ph}"])
+        m[f"runs_{ph}"] = b[f"runs_{ph}"]
+        m[f"boundary_percentage_{ph}"] = _ratio(
+            b[f"boundaries_conceded_{ph}"], b[f"balls_{ph}"])
     return m
 
 

@@ -149,13 +149,18 @@ model:
   # the best epoch is consistently worse for the big model. Smaller
   # is the right default when the capacity is provably unused.
   #
-  # Ladder, in order -- re-run each with run_seeds, stop at the first
-  # rung where the median stops improving:
-  #     []              linear baseline, 513 params; run this first
-  #     [32]
-  #     [64, 32]        <- current
-  #     [128, 64]
-  intrinsic_hidden_dims: [64, 32]
+    # Ladder run under run_seeds(seeds=0..4), medians (spread = max-min):
+  #     []          2.6993 (0.031) | mad_log_ratio 0.671 | 1,397 params
+  #     [32]        2.6528 (0.028) | mad_log_ratio 0.580 | 5,363   <- chosen
+  #     [64, 32]    2.6600 (0.030) | mad_log_ratio 0.601 | 11,603
+  #     [128, 64]   2.6516 (0.031) | mad_log_ratio 0.599 | 26,163
+  #
+  # Rung one is the only real step. [128,64] beats [32] on median
+  # loss by 0.0012 against a 0.031 spread -- that is a seed, not a
+  # config. mad_log_ratio and spearman both peak at [32] and degrade
+  # monotonically after it; best_epoch falls 47 -> 23 across the
+  # ladder, i.e. overfit onset arrives earlier at every rung.
+  intrinsic_hidden_dims: [32]
 
   # 16 inputs -- several near-duplicates (players_bought vs
   # remaining_slots are perfectly collinear; auction_order,

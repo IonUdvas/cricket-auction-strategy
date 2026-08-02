@@ -1,5 +1,19 @@
 import numpy as np
 import pandas as pd
+
+from input_creation_2.archetypes import (
+    ARCHETYPES,
+    apply_purchase,
+    archetype_demand,
+    auction_archetype_features,
+    build_archetype_tags,
+    empty_team_archetype_counts,
+    focus_features,
+    pool_archetype_counts,
+    scarcity,
+    tags_for,
+    team_archetype_features,
+)
 import re
 
 from input_creation_2.auction_order import resolve_auction_order
@@ -53,10 +67,20 @@ class AuctionReplayEngine:
         auction_max_purse,
         squad_size=25,
         overseas_limit=8,
+        archetype_df=None,
     ):
 
         self.bid_df = bid_df.copy()
         self.player_df = player_df.copy()
+
+        # Archetype tags turn three coarse role counters into eleven that
+        # match how a squad is actually built. Optional: without the table
+        # the engine keeps emitting the legacy BATTER/BOWLER/ALL-ROUNDER
+        # counters and nothing downstream changes.
+        self.archetype_tags = (
+            build_archetype_tags(archetype_df)
+            if archetype_df is not None else None
+        )
 
         self.auction_max_purse = auction_max_purse
         self.squad_size = squad_size
@@ -443,6 +467,11 @@ class AuctionReplayEngine:
                 "allrounders_bought": 0,
                 "wicketkeepers_bought": 0,
 
+                # Archetype counters live alongside the legacy role
+                # counters rather than replacing them, so an ablation is a
+                # column selection rather than a rebuild.
+                **(empty_team_archetype_counts()
+                   if self.archetype_tags is not None else {}),
             }
             for team in self.teams
         }
@@ -491,6 +520,11 @@ class AuctionReplayEngine:
         if key is not None:
             state[key] += 1
 
+    def _archetypes_of(self, player_id):
+        if self.archetype_tags is None:
+            return ()
+        return tags_for(self.archetype_tags, player_id)
+
     def _snapshot_auction_state(
         self,
         auction_order,
@@ -516,7 +550,32 @@ class AuctionReplayEngine:
                 (remaining["role"] == "WICKETKEEPER").sum(),
             "remaining_overseas":
                 remaining["isPlayerOverseas"].sum(),
+            **self._archetype_auction_state(remaining),
         }
+
+    def _archetype_auction_state(self, remaining):
+        """
+        Per-archetype supply, demand and scarcity over the un-auctioned pool.
+
+        Supply is a count of players still to come; demand is a count of teams
+        that still want the archetype AND have a slot to put him in. The ratio
+        is what makes a fourth right-arm seamer cheap in a year with thirty of
+        them and expensive in a year with four.
+        """
+        if self.archetype_tags is None:
+            return {}
+
+        pool = pool_archetype_counts(
+            remaining["playerId"].to_numpy(),
+            self.archetype_tags,
+        )
+        demand = archetype_demand(self.team_state)
+        scarce = scarcity(pool, demand)
+
+        out = auction_archetype_features(pool)
+        out.update({f"{a}_demand": int(demand[a]) for a in ARCHETYPES})
+        out.update({f"{a}_scarcity": float(scarce[a]) for a in ARCHETYPES})
+        return out
     
     def _build_bid_summary(
         self,
@@ -1027,6 +1086,32 @@ class AuctionReplayEngine:
         )
 
         ############################################################
+        # Archetype focus
+        ############################################################
+        #
+        # Sending every archetype's state on every row asks the model
+        # to learn that wrist-spin supply is irrelevant while an
+        # opener is being sold. The focus block sends only the
+        # archetypes THIS player carries, reduced to fixed width
+        # because the number of them varies from one to four.
+        # It is team-specific, so it is built inside the team loop.
+        ############################################################
+
+        own_archetypes = self._archetypes_of(player["playerId"])
+        remaining_ids = (
+            self.player_df.iloc[auction_order:]["playerId"].to_numpy()
+            if self.archetype_tags is not None else []
+        )
+        pool_counts = (
+            pool_archetype_counts(remaining_ids, self.archetype_tags)
+            if self.archetype_tags is not None else {}
+        )
+        demand_counts = (
+            archetype_demand(self.team_state)
+            if self.archetype_tags is not None else {}
+        )
+
+        ############################################################
         # One row per team
         ############################################################
 
@@ -1041,6 +1126,17 @@ class AuctionReplayEngine:
 
             team_state = self.team_state[team].copy()
             interval = bid_summary[team].copy()
+
+            if self.archetype_tags is not None:
+                team_state.update(team_archetype_features(team_state))
+                team_state.update(focus_features(
+                    own_archetypes,
+                    team_state,
+                    pool_counts,
+                    demand_counts,
+                    remaining_ids,
+                    self.archetype_tags,
+                ))
 
             ########################################################
             # Individual outputs
@@ -1160,6 +1256,24 @@ class AuctionReplayEngine:
             state,
             player["role"],
         )
+
+        ############################################################
+        # Archetypes
+        ############################################################
+        #
+        # A player increments EVERY archetype he carries, so these
+        # counters do not sum to players_bought. That is deliberate:
+        # they count role coverage, not bodies. Jadeja fills a
+        # middle-order slot, a finisher slot, a finger-spin slot and a
+        # bowling-allrounder slot at once, which is exactly why a team
+        # pays for him.
+        ############################################################
+
+        if self.archetype_tags is not None:
+            apply_purchase(
+                state,
+                self._archetypes_of(player["playerId"]),
+            )
 
     def _apply_retention(
         self,
