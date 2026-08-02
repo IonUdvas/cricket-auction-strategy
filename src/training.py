@@ -25,10 +25,15 @@ from input_creation_2.auction_dataset_utils import (
     build_training_samples,
     build_encoders,
     build_role_table,
+    build_demographic_features,
     PlayerFeatureContext,
     DEFAULT_PLAYER_CONTEXT_COLUMNS,
 )
 from input_creation_2.auction_dataset import IPLAuctionDataset
+from input_creation_2.verification import (
+    verify_year,
+    verify_feature_monotonicity,
+)
 from valuation_model.models import *
 from valuation_model.losses import *
 from valuation_model.training import *
@@ -220,6 +225,8 @@ def build_training_df(
         resolution=None,
         feature_context=None,
         player_context_columns=None,
+        verify=None,
+        verify_strict=None,
 ):
     """
     player_template / bid_template : paths containing "{year}".  Default to
@@ -249,6 +256,25 @@ def build_training_df(
                  build_training_samples has taken this argument since the
                  promotion was added and nothing ever passed it, so the
                  "behind a config flag" in that comment was not true.
+    verify     : bool or None. Run input_creation_2.verification after each
+                 year and the cross-year monotonicity check after all of
+                 them. None reads data.verify from the config (default True).
+
+                 verification.py's docstring said this function called it.
+                 It did not -- nothing imported the module at all, so the
+                 checks that exist specifically to catch "right shape, wrong
+                 numbers" had never run on a single build. They are cheap
+                 (seconds against minutes for the build itself) and print
+                 only findings, so the default is on.
+    verify_strict : bool or None. Turn `error`-severity findings into a
+                 ValueError instead of a printed line. None reads
+                 data.verify_strict from the config (default False).
+
+                 Off by default deliberately: an error-severity finding here
+                 means the frame is wrong, but some of these checks have
+                 never been run against real data, so the first few builds
+                 should report rather than halt. Turn it on per the module
+                 docstring once a year is known good.
     """
     if player_template is None:
         player_template = default_player_template()
@@ -288,7 +314,14 @@ def build_training_df(
             list(DEFAULT_PLAYER_CONTEXT_COLUMNS),
         )
 
+    data_cfg = config.get("data", {}) or {}
+    if verify is None:
+        verify = data_cfg.get("verify", True)
+    if verify_strict is None:
+        verify_strict = data_cfg.get("verify_strict", False)
+
     training_dfs = {}
+    findings = []
     for year, auction_date in selected_years.items():
         print(f"Building {year}...")
         training_df = build_training_samples(
@@ -301,6 +334,48 @@ def build_training_df(
         )
         training_dfs[year] = training_df
         print(f"Finished {year}: {len(training_df)} training rows")
+
+        ############################################################
+        # Verify here, on the single-year frame, not later on the
+        # concatenation. Half these checks are only meaningful per
+        # auction: "rows vs players x teams" and "winner rows vs sold
+        # players" both compare against that year's roster, and both
+        # are trivially satisfied by a concatenated frame no matter
+        # how wrong any individual year is.
+        ############################################################
+
+        if verify:
+            frame = verify_year(
+                year,
+                training_df,
+                engine_report=training_df.attrs.get("engine_report"),
+            )
+            findings.append(frame)
+
+    if verify and findings:
+        all_findings = pd.concat(findings, ignore_index=True)
+
+        # Cross-year as-of check. Needs every year at once, so it can
+        # only run here -- and it is the one check that can catch as-of
+        # leakage without a second source of truth.
+        verify_feature_monotonicity(training_dfs)
+
+        errors = all_findings[all_findings["severity"] == "error"]
+        if len(errors) and verify_strict:
+            lines = "\n".join(
+                f"  {r.year} {r.check}: {r.value} {r.detail}"
+                for r in errors.itertuples()
+            )
+            raise ValueError(
+                f"verification found {len(errors)} error-severity "
+                f"finding(s) and data.verify_strict is on:\n{lines}"
+            )
+        if len(errors):
+            print(
+                f"\n  VERIFICATION: {len(errors)} error-severity finding(s) "
+                f"across {errors['year'].nunique()} year(s). Listed above. "
+                f"Set data.verify_strict to make these raise."
+            )
 
     # pandas silently drops attrs to {} when concatenated frames disagree, and
     # IPLAuctionDataset then dies with a bare KeyError far from the cause.
@@ -319,6 +394,14 @@ def build_training_df(
                 )
 
     full_training_df = pd.concat(training_dfs.values(), ignore_index=True)
+
+    # engine_report is a per-auction diagnostic. `reference` is year one's
+    # attrs, so carrying it through would label the whole frame with the
+    # first auction's replay stats -- a number that looks authoritative and
+    # describes one ninth of the rows. It has already been consumed by
+    # verify_year above.
+    reference.pop("engine_report", None)
+
     full_training_df.attrs = reference
 
     return full_training_df
@@ -373,6 +456,14 @@ def run_training_pipeline(
         drop_leaky_columns=data_cfg.get("drop_role_leaky_columns", True),
     )
 
+    # Age and last salary. Same position as the role table and for the
+    # same reason -- last_salary needs every year present at once, and
+    # build_training_df has just concatenated them.
+    demo_frame, demo_columns = build_demographic_features(
+        full_training_df,
+        player_role_df=player_role_df,
+    )
+
     # pd.concat(axis=1) returns a NEW frame and does not carry .attrs across,
     # so the column-group contract set in build_training_samples would be lost
     # here and IPLAuctionDataset would fail on player_feature_columns. Capture
@@ -380,12 +471,15 @@ def run_training_pipeline(
     _attrs = dict(full_training_df.attrs)
 
     full_training_df = pd.concat(
-        [full_training_df.reset_index(drop=True), role_frame],
+        [full_training_df.reset_index(drop=True), role_frame, demo_frame],
         axis=1,
     )
 
     full_training_df.attrs = _attrs
     full_training_df.attrs["role_columns"] = role_columns
+    full_training_df.attrs["player_feature_columns"] = (
+        list(_attrs["player_feature_columns"]) + demo_columns
+    )
 
     # No holdout here, so there is no split to leak across: the
     # scalers are fit on the one frame that exists.
@@ -578,6 +672,23 @@ def prepare_holdout_data(
         drop_leaky_columns=data_cfg.get("drop_role_leaky_columns", True),
     )
 
+    ################################################################
+    # Age and last salary, built on the same train+val union and for
+    # a stronger reason than the role table: last_salary is defined
+    # against the auctions BEFORE this row's, so a 2026 val row needs
+    # the 2025 train auction to have a value at all. Built per split,
+    # every val player would be a debutant.
+    #
+    # The join is strictly backward, so this direction of sharing
+    # does not leak: no row of either split can see its own auction's
+    # prices, and no train row can see anything from a val year.
+    ################################################################
+
+    demo_frame, demo_columns = build_demographic_features(
+        combined_df,
+        player_role_df=player_role_df,
+    )
+
     # Preserve existing attrs 
     train_attrs = dict(train_df.attrs) 
     val_attrs = dict(val_df.attrs)
@@ -585,15 +696,32 @@ def prepare_holdout_data(
     train_roles = role_frame.iloc[: len(train_df)].reset_index(drop=True) 
     val_roles = role_frame.iloc[len(train_df):].reset_index(drop=True)
 
-    train_df = pd.concat( [train_df.reset_index(drop=True), train_roles], axis=1, )
+    train_demo = demo_frame.iloc[: len(train_df)].reset_index(drop=True)
+    val_demo = demo_frame.iloc[len(train_df):].reset_index(drop=True)
 
-    val_df = pd.concat( [val_df.reset_index(drop=True), val_roles], axis=1, )
+    train_df = pd.concat( [train_df.reset_index(drop=True), train_roles, train_demo], axis=1, )
+
+    val_df = pd.concat( [val_df.reset_index(drop=True), val_roles, val_demo], axis=1, )
 
     # Restore attrs and add role columns 
     train_df.attrs = train_attrs 
     val_df.attrs = val_attrs 
     train_df.attrs["role_columns"] = role_columns 
     val_df.attrs["role_columns"] = role_columns
+
+    ################################################################
+    # Demographics join the PLAYER block rather than becoming a block
+    # of their own: they are per-player facts known pre-auction, and
+    # last_salary is in lakhs, so it needs the log compression
+    # BlockScaler already applies to the player block's career totals.
+    # A separate block would need its own scaler and its own model
+    # input head for four columns.
+    ################################################################
+
+    for frame in (train_df, val_df):
+        frame.attrs["player_feature_columns"] = (
+            list(frame.attrs["player_feature_columns"]) + demo_columns
+        )
 
     return train_df, val_df, encoder_manager, role_columns
 

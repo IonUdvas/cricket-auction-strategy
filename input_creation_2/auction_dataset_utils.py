@@ -6,6 +6,7 @@ from input_creation_2.player_features.player_features import PlayerStatsAggregat
 from input_creation_2.player_features.identity import PlayerIdentityResolver
 from input_creation_2.player_features.squad_index import SquadIndex
 from input_creation_2.player_features.delivery_loader import load_deliveries
+from input_creation_2.player_features import demographics as demog
 from input_creation_2.auction_replay_engine import AuctionReplayEngine
 
 
@@ -688,11 +689,39 @@ def build_training_samples(
     # Store Feature Groups
     ############################################################
 
+    ############################################################
+    # Which auction this row belongs to.
+    #
+    # The frame did not carry its own date. Every consumer either
+    # took the date as a separate argument or was handed one year's
+    # frame and told which year it was -- which works right up until
+    # frames are concatenated, and then the year is unrecoverable
+    # from the row. `last_salary` needs exactly that: "the most
+    # recent price strictly before THIS row's auction" cannot be
+    # expressed without a per-row year.
+    #
+    # These are metadata, not features. Nothing adds them to any
+    # attrs[...] column list, and the three feature blocks are built
+    # from explicit lists rather than from "every column not in
+    # metadata_columns", so an extra column here cannot drift into
+    # the model.
+    ############################################################
+
+    training_df["auction_year"] = int(pd.to_datetime(auction_date).year)
+    training_df["auction_date"] = pd.to_datetime(auction_date)
+
+    # verify_year() reads this. Attached rather than returned so the
+    # signature does not change for callers that do not verify.
+    training_df.attrs["engine_report"] = engine.quality_report()
+
     metadata_columns = {
 
         "playerId",
         "playerName",
         "team",
+
+        "auction_year",
+        "auction_date",
 
         "country",
         "countryId",
@@ -959,3 +988,247 @@ def add_player_context_features(training_df, columns=None, verbose=True):
             print(f"    {line}")
 
     return training_df
+
+####################################################################
+# Demographics: age and last salary, as of each row's own auction.
+#
+# These are the two features player_features/demographics.py was
+# written to supply and that nothing ever called. The module has
+# existed, correct and unreachable, since the leak note above
+# ("age is genuinely useful and date_of_birth is available; the
+# right fix is to compute it against each row's own auction date")
+# was written. This is the call site that note asked for.
+#
+# WHY NOT IN build_training_samples, next to the other features:
+#
+#   `last_salary` is "the most recent price strictly before this
+#   row's auction". A 2022 row needs the 2021 and 2020 auctions.
+#   build_training_samples sees exactly one auction, so computed
+#   there every player would be a debutant forever.
+#
+#   So this runs on the CONCATENATED frame -- the same position, and
+#   for the same reason, as build_role_table. In the holdout pipeline
+#   that concatenation is train + val together, which is deliberate:
+#   a 2026 val row must be able to see the 2025 price. That is not
+#   leakage in the direction that matters, because the join is
+#   strictly backward (allow_exact_matches=False), so a train row can
+#   never see a price from its own or any later auction, and no row
+#   of either split can see its own label.
+####################################################################
+
+# The statuses that mean money actually changed hands. A player who
+# went unsold has no salary that year -- not a salary of zero -- and
+# folding him in as 0 would drag every later last_salary toward the
+# floor. Spelt as a superset of the vocabularies seen across the nine
+# auctions; PAID_STATUS_REPORT below prints what was actually matched
+# so a new spelling shows up as a number rather than as silence.
+PAID_AUCTION_STATUSES = (
+    "SOLD",
+    "RTM",
+    "RETAINED",
+    "TRADED",
+)
+
+# Statuses that mean no money changed hands, listed explicitly rather
+# than left to fall through. Without this the "unrecognised status"
+# warning below fires on UNSOLD on every single build -- and a warning
+# that is always wrong is a warning nobody reads, which defeats the
+# point of having it for the status that genuinely is new.
+UNPAID_AUCTION_STATUSES = (
+    "UNSOLD",
+    "NOT SOLD",
+    "NOTSOLD",
+    "WITHDRAWN",
+    "UNAVAILABLE",
+)
+
+
+def build_demographic_features(
+    training_df,
+    player_role_df=None,
+    paid_statuses=PAID_AUCTION_STATUSES,
+    verbose=True,
+):
+    """
+    Build the age / last-salary block for an already-concatenated frame.
+
+    Returns (demo_frame, demo_columns) -- the same contract as
+    build_role_table, so the caller splits and re-attaches it the same
+    way. The columns belong in attrs["player_feature_columns"]: they are
+    per-player facts known before the hammer falls, and last_salary in
+    particular is in lakhs, so it needs BlockScaler's log compression
+    that the player block already applies.
+
+    The four columns are emitted UNCONDITIONALLY, even when the whole
+    block is missing:
+
+        age, age_is_missing, last_salary, last_salary_is_missing
+
+    A block whose WIDTH depends on the data is the failure
+    add_player_context_features documents at length -- train and val are
+    checked against each other on column names, and a column present in
+    one and absent in the other is either a silent drop (scalers on) or
+    a shape mismatch inside the first nn.Linear (scalers off). Four
+    constant columns cost twelve weights; a schema that is a property of
+    the data costs an afternoon.
+
+    player_role_df : the archetype table, for date_of_birth. Optional.
+        Without it there is no DOB anywhere in the pipeline, so age is
+        emitted all-missing and says so loudly rather than silently
+        coming out as everyone being the same age.
+    """
+
+    required = {"playerId", "auction_year", "auction_date"}
+    missing = required - set(training_df.columns)
+    if missing:
+        raise ValueError(
+            f"build_demographic_features needs {sorted(missing)} on the "
+            f"frame. auction_year/auction_date are stamped by "
+            f"build_training_samples; a frame built before that change "
+            f"does not carry them and must be rebuilt."
+        )
+
+    keys = training_df[["playerId", "auction_year", "auction_date"]].copy()
+    demo_frame = pd.DataFrame(index=training_df.index)
+    summary = []
+
+    ################################################################
+    # Age, against each row's own auction date.
+    ################################################################
+
+    dob_source = None
+    if player_role_df is not None:
+        role_df = player_role_df.copy()
+        if "player_id" in role_df.columns:
+            role_df = role_df.rename(columns={"player_id": "playerId"})
+        if {"playerId", "date_of_birth"} <= set(role_df.columns):
+            role_df["playerId"] = pd.to_numeric(
+                role_df["playerId"], errors="coerce"
+            )
+            # build_demographics wants country alongside DOB; it is not
+            # used here (country reaches the model as isPlayerOverseas)
+            # but is required by that function's contract, so supply it
+            # empty rather than fork the function.
+            if "country" not in role_df.columns:
+                role_df["country"] = pd.NA
+            dob_source = demog.build_demographics(
+                role_df, id_column="playerId"
+            )
+
+    if dob_source is not None:
+        with_age = demog.add_age_feature(
+            keys,
+            dob_source,
+            id_column="playerId",
+            date_column="auction_date",
+            out_column="age",
+        )
+        demo_frame["age"] = with_age["age"].to_numpy()
+        demo_frame["age_is_missing"] = with_age["age_is_missing"].to_numpy()
+
+        known = demo_frame["age_is_missing"] == 0
+        if known.any():
+            summary.append(
+                f"age: {int(known.sum())}/{len(demo_frame)} rows resolved, "
+                f"range {demo_frame.loc[known, 'age'].min():.1f}-"
+                f"{demo_frame.loc[known, 'age'].max():.1f} years"
+            )
+        else:
+            summary.append(
+                "age: NO row resolved -- date_of_birth present but never "
+                "matched a playerId. Check the archetype table's id column."
+            )
+    else:
+        demo_frame["age"] = 0.0
+        demo_frame["age_is_missing"] = 1.0
+        summary.append(
+            "age: NOT AVAILABLE -- no player_role_df with date_of_birth was "
+            "passed, so the column is constant and carries no signal. Pass "
+            "the archetype table to enable it."
+        )
+
+    ################################################################
+    # Last salary, strictly before this row's auction.
+    ################################################################
+
+    if {"auctionPrice", "auctionStatus"} <= set(training_df.columns):
+
+        # One row per (player, auction), not one per (player, team):
+        # the frame carries a row per team per player, so the raw frame
+        # would repeat each price ~10 times. merge_asof would still pick
+        # a correct value, but every count and every diagnostic below
+        # would be off by the number of teams.
+        paid = training_df[["playerId", "auction_year",
+                            "auctionPrice", "auctionStatus"]].copy()
+        paid = paid.drop_duplicates(["playerId", "auction_year"])
+
+        observed = sorted(
+            str(s).upper()
+            for s in paid["auctionStatus"].dropna().unique()
+        )
+        known = ({s.upper() for s in paid_statuses}
+                 | {s.upper() for s in UNPAID_AUCTION_STATUSES})
+        unrecognised = [s for s in observed if s not in known]
+
+        salary_history = demog.build_salary_history(
+            paid,
+            id_column="playerId",
+            year_column="auction_year",
+            price_column="auctionPrice",
+            sold_statuses=paid_statuses,
+        )
+
+        with_salary = demog.add_last_salary_feature(
+            keys,
+            salary_history,
+            id_column="playerId",
+            year_column="auction_year",
+            out_column="last_salary",
+        )
+        demo_frame["last_salary"] = with_salary["last_salary"].to_numpy()
+        demo_frame["last_salary_is_missing"] = (
+            with_salary["last_salary_is_missing"].to_numpy()
+        )
+
+        has = demo_frame["last_salary_is_missing"] == 0
+        line = (
+            f"last_salary: {int(has.sum())}/{len(demo_frame)} rows have a "
+            f"prior price ({has.mean():.1%}); "
+            f"{len(salary_history)} paid (player, auction) pairs across "
+            f"{[int(y) for y in sorted(salary_history['year'].unique())]}"
+        )
+        if unrecognised:
+            ############################################################
+            # A status this list does not know is a player treated as
+            # never paid. That is the silent-wrong-number failure this
+            # whole module is guarding against, so it is a warning, not
+            # a debug line.
+            ############################################################
+            line += (
+                f"\n      WARNING: auctionStatus values in neither the paid "
+                f"nor the unpaid list: {unrecognised}. They are being treated "
+                f"as unpaid. If any of them means money changed hands, add it "
+                f"to PAID_AUCTION_STATUSES -- until then every affected "
+                f"player is a debutant forever."
+            )
+        summary.append(line)
+
+    else:
+        demo_frame["last_salary"] = 0.0
+        demo_frame["last_salary_is_missing"] = 1.0
+        summary.append(
+            "last_salary: NOT AVAILABLE -- auctionPrice/auctionStatus absent "
+            "from the frame."
+        )
+
+    demo_columns = ["age", "age_is_missing",
+                    "last_salary", "last_salary_is_missing"]
+
+    demo_frame = demo_frame[demo_columns].astype(float)
+
+    if verbose:
+        print("  build_demographic_features:")
+        for line in summary:
+            print(f"    {line}")
+
+    return demo_frame, demo_columns

@@ -1,14 +1,21 @@
 """
 In-pipeline verification of the built training frames.
 
-`build_training_df` calls this after every year is built.  It is
-deliberately cheap and deliberately noisy: the failures it looks for
-are the ones that produce a frame of the right shape full of wrong
-numbers, which is the only kind of failure this pipeline has actually
-had.
+`build_training_df` calls `verify_year` after every year is built and
+`verify_feature_monotonicity` after all of them.  It is deliberately
+cheap and deliberately noisy: the failures it looks for are the ones
+that produce a frame of the right shape full of wrong numbers, which is
+the only kind of failure this pipeline has actually had.
 
-Nothing here raises by default.  Pass strict=True to turn the
-structural checks into exceptions once a year is known good.
+Nothing here raises, ever.  `verify_year` returns a findings frame with
+a `severity` column and prints the `error`/`warn` rows; deciding what an
+error means is the caller's job.  build_training_df does that under
+`data.verify_strict` in the config, which turns any error-severity
+finding into a ValueError.  Turn it on once a year is known good.
+
+(An earlier version of this docstring said the checks took a
+`strict=True` argument and that build_training_df already called them.
+Neither was true -- nothing imported this module at all.)
 """
 
 import numpy as np

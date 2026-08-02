@@ -21,6 +21,29 @@ seed: 42
 
 data:
 
+  # Run input_creation_2/verification.py during the build: verify_year
+  # after each auction, verify_feature_monotonicity across all of them.
+  #
+  # That module existed, complete, and unreachable -- its docstring said
+  # build_training_df called it, and nothing imported it. So the checks
+  # written specifically to catch "frame of the right shape full of
+  # wrong numbers" had never run on a single build. Cost is seconds
+  # against the minutes the build itself takes, and a clean year prints
+  # one line, so leave it on.
+  #
+  # The monotonicity check is the valuable one: career totals are
+  # cumulative, so a player's bat_runs as of 2020 can never be below
+  # his bat_runs as of 2019. That inequality is the only way to catch
+  # an as-of leak using nothing but the pipeline's own output.
+  verify: true
+
+  # Turn error-severity findings into a ValueError instead of a printed
+  # summary. Off by default because these checks have never been run
+  # against the real frames: the first few builds should report rather
+  # than halt, in case a check is wrong rather than the data. Turn it on
+  # per year once that year comes back clean.
+  verify_strict: false
+
   # VERIFIED FIX. Fit BlockScalers on the TRAIN split, apply to both.
   # valuation_model/scaling.py existed for exactly this, its docstring
   # explains why, IPLAuctionDataset already took a `scalers=`

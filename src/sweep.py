@@ -69,6 +69,13 @@ from src.experiments import _deep_update, summarize_predictions
 #
 # `scale_features` is NOT here on purpose: it lives in stage 2, so toggling
 # it costs a scaler fit rather than a full rebuild.
+#
+# `verify` / `verify_strict` are not here either, and that one is a genuine
+# trade rather than an oversight. They run inside stage 1 but do not change
+# a single value in the frame, so including them would throw away a good
+# cached build to re-run checks. The cost is that turning verify_strict on
+# mid-sweep will not re-check an already-cached build -- clear the cache if
+# that is what you are after.
 DATA_KEYS_AFFECTING_BUILD = (
     "player_context_columns",
     "max_role_cardinality",
