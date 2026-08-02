@@ -85,6 +85,27 @@ MAX_DEPTH = 6
 # Directory names that are never worth walking into.
 _SKIP_DIRS = {".git", "__pycache__", ".ipynb_checkpoints"}
 
+# This repository's own directory.
+#
+# It is EXCLUDED from every search, and that exclusion is the whole point of
+# this module. The obvious version of "no repo fallback" -- simply not listing
+# the repo among the roots -- is not enough, and here is the exact way it
+# fails:
+#
+#     %cd /kaggle/working
+#     !git clone .../cricket-auction-strategy.git
+#
+# The clone now sits INSIDE /kaggle/working, which is a legitimate search root
+# (it is where this session's builds go) and is searched BEFORE /kaggle/input
+# so that a fresh build beats a stale mount. So the walk descends into the
+# clone, finds data/raw/shotquality, and cheerfully reports the repo as the
+# "inputs dataset" -- while the real, mounted dataset sits there unread. Every
+# path resolves, nothing errors, and the run is silently reading a copy whose
+# version nobody recorded.
+#
+# That is not hypothetical. It happened on the first real Kaggle run.
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
 
 # ---------------------------------------------------------------------------
 # The datasets this project needs
@@ -134,6 +155,16 @@ def _attach_hint(dataset=None):
 # Search roots
 # ---------------------------------------------------------------------------
 
+def _inside_repo(path):
+    """True if `path` is the repo directory or anything under it."""
+    try:
+        p = os.path.realpath(path)
+        r = os.path.realpath(REPO_ROOT)
+    except OSError:
+        return False
+    return p == r or p.startswith(r + os.sep)
+
+
 def _env_roots():
     env = os.environ.get(ENV_OVERRIDE)
     return [p for p in (env.split(os.pathsep) if env else []) if p]
@@ -174,6 +205,10 @@ def data_roots(extra=None):
         if not r:
             continue
         r = os.path.abspath(r)
+        # A root that IS the repo, or lives inside it, is dropped outright.
+        # See the REPO_ROOT comment above.
+        if _inside_repo(r):
+            continue
         if r not in seen and os.path.isdir(r):
             seen.add(r)
             out.append(r)
@@ -190,7 +225,11 @@ def _walk(root, max_depth=MAX_DEPTH):
     # plainly sitting there. Depth is capped below, so there is no runaway
     # even if a link points at an ancestor.
     for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
-        dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIRS)
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d not in _SKIP_DIRS
+            and not _inside_repo(os.path.join(dirpath, d))
+        )
         if dirpath.rstrip(os.sep).count(os.sep) - base_depth >= max_depth:
             dirnames[:] = []
         yield dirpath, dirnames, filenames
@@ -501,6 +540,11 @@ def output_dir(subdir=None):
     base = KAGGLE_WORKING if os.path.isdir(KAGGLE_WORKING) else \
         os.path.abspath(os.environ.get("CRICKET_OUTPUT_DIR", "outputs"))
     path = os.path.join(base, subdir) if subdir else base
+    if _inside_repo(path):
+        raise ValueError(
+            f"refusing to write data into the repository ({path}). "
+            f"Set CRICKET_OUTPUT_DIR to a directory outside it."
+        )
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -619,7 +663,16 @@ def describe():
     first cell of any Kaggle notebook using this repo.
     """
     print(f"{ENV_OVERRIDE:20s}: {os.environ.get(ENV_OVERRIDE) or '(unset)'}")
+    print(f"{'repo root':20s}: {REPO_ROOT}  (EXCLUDED from all searches)")
     print(f"{'output dir':20s}: {output_dir()}")
+
+    stale = os.path.join(REPO_ROOT, "data")
+    if os.path.isdir(stale):
+        n = sum(len(f) for _, _, f in os.walk(stale))
+        print(f"\n  WARNING: {stale} still exists and holds {n} files.")
+        print("  It is ignored -- nothing below reads from it -- but it means")
+        print("  the history purge has not run yet, so every clone still")
+        print("  drags ~231 MB. See scripts/purge_data_from_history.sh.")
 
     print("\nsearch roots (in order):")
     for r in data_roots() or ["(nothing mounted)"]:
