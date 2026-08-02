@@ -428,7 +428,7 @@ def run_training_pipeline(
     return model, history, encoder_manager, dataset, loader, full_training_df
 
 
-def run_training_pipeline_with_holdout(
+def prepare_holdout_data(
         player_template=None,
         bid_template=None,
         bbb_dir=None,
@@ -438,27 +438,30 @@ def run_training_pipeline_with_holdout(
         competitions=None,
         overrides=None,
         resolution=None,
-        scale_features=None,
 ):
     """
-    Same as run_training_pipeline, but builds train_years and val_years
-    as separate auctions, trains only on train_years, and evaluates
-    (no gradient updates) on val_years each epoch.
+    STAGE 1 of the holdout pipeline: everything that does NOT depend on the
+    seed, the model config, or the training config.
 
-    scale_features : bool or None
-        Fit BlockScalers on the TRAIN frame and apply them to both
-        splits. None reads data.scale_features from the config
-        (default True). valuation_model/scaling.py has existed, with
-        a docstring explaining why raw career totals in the thousands
-        cannot share an nn.Linear with 0/1 flags, and nothing in the
-        repo ever called fit_scalers -- both datasets were built with
-        scalers=None, the path its own docstring calls "only ever
-        right for a smoke test".
+    Returns (train_df, val_df, encoder_manager, role_columns).
 
-    Example
-    -------
-    train_years = [2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
-    val_years = [2026]
+    This is split out because it is the expensive half and it is constant
+    across a sweep. One call reads deliveries.parquet (~2.4M rows), resolves
+    identity across all nine auction rosters, and runs nine auction replays --
+    minutes of work -- and the ONLY config keys that reach it are:
+
+        data.player_context_columns
+        data.max_role_cardinality
+        data.drop_role_identity_columns
+        data.drop_role_leaky_columns
+
+    Nothing under model.* or training.*, and not the seed. So a sweep of 36
+    model/training configs x 5 seeds needs ONE call to this function, not 180.
+    See src/sweep.py, which caches on exactly those four keys.
+
+    `data.scale_features` deliberately lives in stage 2 instead: scalers are
+    cheap to fit and keeping them out of the cache key means toggling scaling
+    does not force a rebuild.
     """
 
     ################################################################
@@ -473,9 +476,10 @@ def run_training_pipeline_with_holdout(
     # deliveries twice for no benefit.
     ################################################################
 
-    seed = set_seed()
-    if seed is not None:
-        print(f"seed: {seed}")
+    # No set_seed() here. Stage 1 is seed-independent by construction --
+    # replaying an auction and aggregating deliveries draws no random
+    # numbers -- and seeding inside it would be misleading about that.
+    # The wrapper below seeds before stage 2, where it matters.
 
     if player_template is None:
         player_template = default_player_template()
@@ -591,6 +595,29 @@ def run_training_pipeline_with_holdout(
     train_df.attrs["role_columns"] = role_columns 
     val_df.attrs["role_columns"] = role_columns
 
+    return train_df, val_df, encoder_manager, role_columns
+
+
+def train_from_prepared(prepared, seed=None, scale_features=None):
+    """
+    STAGE 2: everything that DOES depend on the seed and on model/training
+    config. Cheap by comparison -- a few thousand parameters over ~15k rows.
+
+    `prepared` is the tuple returned by prepare_holdout_data.
+
+    On the seed: set_seed() is called HERE, immediately before anything
+    stochastic. run_training_pipeline_with_holdout still calls it at the top
+    as it always did, so calling that function directly behaves exactly as
+    before. The two orderings agree as long as stage 1 draws no random
+    numbers -- which it should not, but "should not" is not "does not", so
+    src/sweep.py ships check_build_rng_neutral() to prove it on your data
+    before you trust a cached sweep.
+    """
+    train_df, val_df, encoder_manager, role_columns = prepared
+    set_seed(seed)
+
+    data_cfg = config.get("data", {}) or {}
+
     ################################################################
     # Input scaling: fit on TRAIN only, apply to both.
     #
@@ -688,3 +715,63 @@ def run_training_pipeline_with_holdout(
         "val_df": val_df,
         "val_predictions": val_predictions,
     }
+
+def run_training_pipeline_with_holdout(
+        player_template=None,
+        bid_template=None,
+        bbb_dir=None,
+        train_years=None,
+        val_years=None,
+        player_role_df=None,
+        competitions=None,
+        overrides=None,
+        resolution=None,
+        scale_features=None,
+        prepared=None,
+):
+    """
+    Build train_years and val_years as separate auctions off ONE feature
+    context, train on train_years, evaluate on val_years each epoch.
+
+    Signature and return value are unchanged; this is now a thin wrapper over
+    prepare_holdout_data + train_from_prepared, which exist so a sweep can
+    call the first once and the second many times.
+
+    prepared : the tuple from prepare_holdout_data, optional.
+        Pass it to skip the rebuild. Everything else about the run is
+        identical. This is the entire reason a 5-seed sweep does not need to
+        read 2.4M deliveries five times.
+
+    scale_features : bool or None
+        Fit BlockScalers on the TRAIN split and apply to both. None reads
+        data.scale_features from the config (default True).
+        valuation_model/scaling.py has existed, with a docstring explaining
+        why raw career totals in the thousands cannot share an nn.Linear with
+        0/1 flags, and nothing in the repo ever called fit_scalers -- both
+        datasets were built with scalers=None, the path its own docstring
+        calls "only ever right for a smoke test".
+
+    Example
+    -------
+    train_years = [2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    val_years = [2026]
+    """
+    seed = set_seed()
+    if seed is not None:
+        print(f"seed: {seed}")
+
+    if prepared is None:
+        prepared = prepare_holdout_data(
+            player_template=player_template,
+            bid_template=bid_template,
+            bbb_dir=bbb_dir,
+            train_years=train_years,
+            val_years=val_years,
+            player_role_df=player_role_df,
+            competitions=competitions,
+            overrides=overrides,
+            resolution=resolution,
+        )
+
+    return train_from_prepared(prepared, seed=seed,
+                               scale_features=scale_features)
