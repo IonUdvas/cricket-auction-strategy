@@ -38,14 +38,16 @@ class PlayerFeatureContext:
             raise NotADirectoryError(
                 f"{bbb_dir} is a single parquet file. This pipeline now needs "
                 f"the DIRECTORY that data.build_bbb writes, holding "
-                f"{', '.join(need)}. Use the repo's data/bbb, or rebuild with "
-                f"`python -m data.build_bbb --out-dir data/bbb`."
+                f"{', '.join(need)}. Leave bbb_dir=None to resolve it from "
+                f"the Kaggle inputs dataset, or rebuild it into this session "
+                f"with `python -m pipelines.build_bbb`."
             )
         missing = [f for f in need if not os.path.exists(os.path.join(bbb_dir, f))]
         if missing:
             raise FileNotFoundError(
-                f"{bbb_dir} is missing {missing}. Build it with "
-                f"`python -m data.build_bbb --download --out-dir {bbb_dir}`."
+                f"{bbb_dir} is missing {missing}. Attach the Kaggle dataset "
+                f"udvasbasak2/ipl-auction-model-inputs, or rebuild with "
+                f"`python -m pipelines.build_bbb`."
             )
 
         # load_deliveries, not read_parquet: it merges ball_attributes

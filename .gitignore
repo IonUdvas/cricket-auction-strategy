@@ -216,3 +216,44 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+###############################################################################
+# DATA -- none of this belongs in the repository
+#
+# Every byte of data lives in a Kaggle Dataset. See data_sources.DATASETS and
+# README.md. These rules are a backstop, not the mechanism: the mechanism is
+# that no code path resolves a data file against the repo any more, so a file
+# dropped here is never read even if it is never committed.
+#
+# If you are staging an upload, do it OUTSIDE the repo:
+#   ./scripts/stage_kaggle_upload.sh   ->  ../kaggle-upload/
+###############################################################################
+
+# The old data tree. `data/` is now `pipelines/` and holds code only.
+data/
+/outputs/
+/kaggle-upload/
+
+# Raw / built data by type, wherever it lands.
+*.parquet
+*.pq
+*_json.zip
+*.csv
+*.csv.gz
+*.tsv
+*.feather
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.pt
+*.pth
+*.ckpt
+
+# Not data: the only CSV/YAML the repo is allowed to carry.
+!configs/*.yaml
+
+# Leftover patch and diff artefacts -- the thing that started all this.
+*.patch
+*.orig
+*.rej

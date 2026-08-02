@@ -210,7 +210,7 @@ def _is_subsequence(short, long):
 class PlayerIdentityResolver:
     def __init__(self, people, overrides=None, resolution=None, squad_index=None):
         """
-        people     : people.parquet from data.build_bbb
+        people     : people.parquet from pipelines.build_bbb
                      (person_id, canonical_name, name_variants, key_cricinfo)
         overrides  : optional DataFrame/CSV path with columns
                      playerId, person_id, action  (action in {"map", "block"})
@@ -587,7 +587,7 @@ class PlayerIdentityResolver:
         if self.conflicts or self.ambiguous or self.unresolved:
             lines.append(
                 "  -> resolve these by adding a row to "
-                "data/identity/cricinfo_resolution.csv "
+                "cricinfo_resolution.csv "
                 "(playerId, playerName, cricinfo_id, dob, method, note) "
                 "and re-run"
             )

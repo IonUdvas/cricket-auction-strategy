@@ -1,3 +1,26 @@
+import os
+import random
+import sys
+
+# Path bootstrap FIRST, before any project import.
+#
+# This block used to sit below the imports and read REPO_ROOT five lines
+# before REPO_ROOT was assigned, so importing this module raised
+# `NameError: name 'REPO_ROOT' is not defined` -- every time, on every
+# machine. Even once that is fixed the order still matters: on Kaggle the
+# notebook's working directory is /kaggle/working, not the clone, so
+# `input_creation_2` is not importable until the repo root is on sys.path,
+# and the imports below are what need it.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+import numpy as np
+import pandas as pd
+import yaml
+
+import data_sources as ds
+
 from input_creation_2.auction_dataset_utils import (
     build_training_samples,
     build_encoders,
@@ -12,20 +35,9 @@ from valuation_model.training import *
 from valuation_model.scaling import fit_scalers
 from torch.utils.data import DataLoader
 
-import numpy as np
-import pandas as pd
-import yaml
-
-import os
-import random
-import sys
-
-if REPO_ROOT not in sys.path:
-    sys.path.insert(0, REPO_ROOT)
-
-# Resolve relative to this file rather than a hardcoded Kaggle path, so the
-# module imports on a laptop, in CI and on Kaggle alike.
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# configs/ is code, not data: it is small, versioned, and belongs next to the
+# thing it configures. It is the one path in this module resolved against the
+# repo rather than through data_sources.
 CONFIG_PATH = os.environ.get(
     "CRICKET_CONFIG", os.path.join(REPO_ROOT, "configs", "default.yaml")
 )
@@ -131,30 +143,48 @@ def _train_kwargs(cfg=None):
         "max_grad_norm": cfg.get("max_grad_norm", 5.0),
     }
 
-# The ball data is a DIRECTORY of parquets written by data.build_bbb
+# The ball data is a DIRECTORY of parquets written by pipelines.build_bbb
 # (deliveries / fielding / people / wickets / matches), not the single flat
-# parquet this pipeline used to take.  Defaulting to the repo's own copy means
-# a caller never has to know that.
-# Resolved lazily rather than at import: on Kaggle the repo is cloned before
-# the datasets are guaranteed to be mounted, and a module-level path would
-# freeze whatever was (not) visible at import time.
+# parquet this pipeline used to take.
+#
+# Every one of these is resolved LAZILY, through data_sources, at the moment
+# it is needed -- never at import, and never against the repo. Two reasons,
+# and both have already cost a run:
+#
+#   1. Module-level path constants freeze whatever was visible at import
+#      time. On Kaggle the repo is cloned before the datasets are guaranteed
+#      to be mounted, so a constant computed at import can be a path to
+#      nothing while the real mount appears a second later.
+#   2. A repo-relative default is worse than no default. It resolves,
+#      silently, to a stale local copy, and the run reports numbers that
+#      cannot be reproduced from any dataset version.
+#
+# There are therefore no DEFAULT_BBB_DIR / DEFAULT_RESOLUTION constants. Call
+# the functions.
 def default_bbb_dir():
-    import data_sources as ds
+    """The bbb parquet set, from the inputs dataset or this session's build."""
     return ds.bbb_dir()
 
 
 def default_resolution():
-    import data_sources as ds
-    return ds.find_file("cricinfo_resolution.csv", required=False) or \
-        os.path.join(REPO_ROOT, "data", "identity", "cricinfo_resolution.csv")
+    """
+    The hand-verified identity cache, or None.
+
+    None is a legitimate answer -- the pipeline runs without it -- so this
+    does NOT raise. It is `required=False` inside data_sources and the caller
+    decides. What it must never do is fall back to a repo path.
+    """
+    return ds.resolution_path()
 
 
-# Back-compat: existing callers read these names directly. They fall back to
-# the in-repo copy when nothing is mounted, which is the old behaviour.
-DEFAULT_BBB_DIR = os.path.join(REPO_ROOT, "data", "bbb")
-DEFAULT_RESOLUTION = os.path.join(
-    REPO_ROOT, "data", "identity", "cricinfo_resolution.csv"
-)
+def default_player_template():
+    """completed_players_{year}.csv, from the auction dataset."""
+    return ds.player_template()
+
+
+def default_bid_template():
+    """auction_trail_{year}.csv, from the auction dataset."""
+    return ds.bid_template()
 
 AUCTION_DATES = {
     2018: "2018-01-27",
@@ -181,8 +211,8 @@ AUCTION_MAX_PURSES = {
 }
 
 def build_training_df(
-        player_template,
-        bid_template,
+        player_template=None,
+        bid_template=None,
         bbb_dir=None,
         years=None,
         competitions=None,
@@ -192,15 +222,17 @@ def build_training_df(
         player_context_columns=None,
 ):
     """
+    player_template / bid_template : paths containing "{year}".  Default to
+                 the auction Kaggle dataset via data_sources.
     years      : iterable of int, optional. Defaults to all of AUCTION_DATES.
     bbb_dir    : directory holding deliveries/fielding/people parquet, as
-                 written by data.build_bbb.  Was previously a path to one
-                 parquet file.  Defaults to the repo's own data/bbb.
-    resolution : the cricinfo identity cache.  Defaults to the repo's own
-                 data/identity/cricinfo_resolution.csv -- it used to default to
-                 None, which meant every hand-verified identity in that file was
-                 silently ignored by the training pipeline and players like
-                 Rohit Sharma trained with an empty career.
+                 written by pipelines.build_bbb.  Was previously a path to one
+                 parquet file.  Defaults to the inputs Kaggle dataset.
+    resolution : the cricinfo identity cache, resolved from the inputs Kaggle
+                 dataset.  It used to default to None, which meant every
+                 hand-verified identity in that file was silently ignored by
+                 the training pipeline and players like Rohit Sharma trained
+                 with an empty career.
     feature_context : an already-built PlayerFeatureContext with rosters
                  already registered.  When given, identity is the caller's
                  responsibility and is NOT re-resolved here.  This is how a
@@ -218,9 +250,13 @@ def build_training_df(
                  promotion was added and nothing ever passed it, so the
                  "behind a config flag" in that comment was not true.
     """
+    if player_template is None:
+        player_template = default_player_template()
+    if bid_template is None:
+        bid_template = default_bid_template()
     if bbb_dir is None:
         bbb_dir = default_bbb_dir()
-    if resolution is None and os.path.exists(DEFAULT_RESOLUTION):
+    if resolution is None:
         resolution = default_resolution()
 
     selected_years = (
@@ -309,14 +345,16 @@ def load_and_encode_data(full_training_df, scalers=None):
     return encoder_manager, dataset, loader
 
 def run_training_pipeline(
-        player_template,
-        bid_template,
+        player_template=None,
+        bid_template=None,
         bbb_dir=None,
         player_role_df=None,
 ):
     
     set_seed()
 
+    # Left as None deliberately: build_training_df resolves them, so there is
+    # exactly one place that knows the defaults.
     full_training_df = build_training_df(player_template, bid_template, bbb_dir)
 
     ################################################################
@@ -391,8 +429,8 @@ def run_training_pipeline(
 
 
 def run_training_pipeline_with_holdout(
-        player_template,
-        bid_template,
+        player_template=None,
+        bid_template=None,
         bbb_dir=None,
         train_years=None,
         val_years=None,
@@ -439,9 +477,13 @@ def run_training_pipeline_with_holdout(
     if seed is not None:
         print(f"seed: {seed}")
 
+    if player_template is None:
+        player_template = default_player_template()
+    if bid_template is None:
+        bid_template = default_bid_template()
     if bbb_dir is None:
         bbb_dir = default_bbb_dir()
-    if resolution is None and os.path.exists(DEFAULT_RESOLUTION):
+    if resolution is None:
         resolution = default_resolution()
 
     feature_context = PlayerFeatureContext(

@@ -17,13 +17,13 @@ situations, only two of which are fixable:
                   sources use genuinely different names (Cricsheet
                   files Wanindu Hasaranga under "PWH de Silva"), not
                   because of a spelling variant.  Fixable by hand, via
-                  squad residue -- see data/identity/propose_matches.py.
+                  squad residue -- see pipelines/identity/propose_matches.py.
 
 Triage sorts the fixable ones by how much they cost.  A playerId that
 appears in one auction at base price is worth less of your afternoon
 than one who went for 14 crore, and fixing in price order gets the
 model most of the benefit from the first dozen rows you add to
-data/identity/cricinfo_resolution.csv.
+the cricinfo_resolution.csv carried by the inputs dataset.
 """
 
 import re
@@ -301,7 +301,7 @@ def classify_no_t20_record(triage_frame, feature_context, verbose=True):
 
 def write_resolution_stubs(triage_frame, path, top_n=None):
     """
-    Emit skeleton rows for data/identity/cricinfo_resolution.csv.
+    Emit skeleton rows for the cricinfo_resolution.csv carried by the inputs dataset.
 
     Deliberately leaves cricinfo_id blank.  Filling it is the one step
     that has to be a human looking at a Cricinfo profile -- everything
@@ -332,7 +332,8 @@ def write_resolution_stubs(triage_frame, path, top_n=None):
         f"wrote {len(stub)} stub rows to {path}\n"
         f"  fill in cricinfo_id from the player's Cricinfo URL "
         f"(espncricinfo.com/cricketers/<slug>-<ID>), then append the "
-        f"completed rows to data/identity/cricinfo_resolution.csv"
+        f"completed rows into cricinfo_resolution.csv and re-upload the "
+        f"inputs dataset"
     )
 
     return stub

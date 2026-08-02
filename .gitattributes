@@ -1,0 +1,25 @@
+# Normalise line endings on the way INTO git.
+#
+# This file exists because of a real incident. The working tree was converted
+# to CRLF by a Windows checkout, and `git diff` then reported ~11,000 changed
+# lines across 30 files -- of which exactly two files had any real change in
+# them. The signal was completely buried, and the patch generated from that
+# tree carried \r on every context line, so it would not apply cleanly
+# anywhere.
+#
+# * text=auto tells git to store everything with LF in the repository
+# regardless of what the checkout looks like locally, so this cannot recur.
+* text=auto
+
+*.py    text diff=python
+*.md    text
+*.yaml  text
+*.yml   text
+*.json  text
+*.sh    text eol=lf
+*.ipynb text
+
+# Never touched: binary, and there should be none of these in the repo at all.
+*.parquet binary
+*.zip     binary
+*.png     binary

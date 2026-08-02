@@ -2,12 +2,12 @@
 One-call data checks, meant to be run from a Kaggle notebook after
 cloning the repo.
 
-    !git clone -q https://github.com/<you>/cricket-auction-strategy.git
+    !git clone -q https://github.com/IonUdvas/cricket-auction-strategy.git
     %cd cricket-auction-strategy
 
     from src.checks import run_checks
 
-    chk = run_checks(player_template, bid_template)
+    chk = run_checks()
 
 Everything prints as it goes. The returned object holds the frames, and
 carries the built feature context so follow-up questions are cheap:
@@ -17,8 +17,10 @@ carries the built feature context so follow-up questions are cheap:
     chk.ladder("Rishabh Pant", 2025) # the interval every team got
     chk.triage                       # unresolved playerIds, by cost
 
-The ball data and the resolution cache come from the cloned repo by
-default, so neither needs a path.
+Every path defaults to a Kaggle dataset, resolved through data_sources, so
+none of them needs to be passed. Attach the three datasets listed in
+`data_sources.DATASETS` and call `data_sources.describe()` if anything is
+missing -- it names the dataset to attach rather than the path it wanted.
 """
 
 import os
@@ -35,8 +37,10 @@ from input_creation_2.player_features.identity_triage import (
 from src.training import (
     AUCTION_DATES,
     AUCTION_MAX_PURSES,
-    DEFAULT_BBB_DIR,
-    DEFAULT_RESOLUTION,
+    default_bbb_dir,
+    default_bid_template,
+    default_player_template,
+    default_resolution,
 )
 
 
@@ -229,8 +233,8 @@ class CheckResult:
 
 
 def run_checks(
-    player_template,
-    bid_template,
+    player_template=None,
+    bid_template=None,
     bbb_dir=None,
     resolution=None,
     years=None,
@@ -240,9 +244,10 @@ def run_checks(
     """
     Every data check in one call.
 
-    player_template / bid_template : paths containing "{year}"
-    bbb_dir     : defaults to the cloned repo's own data/bbb
-    resolution  : defaults to the repo's data/identity/cricinfo_resolution.csv
+    player_template / bid_template : paths containing "{year}".  Default to
+                  the auction Kaggle dataset.
+    bbb_dir     : defaults to the bbb parquet set in the inputs Kaggle dataset
+    resolution  : defaults to cricinfo_resolution.csv in the same dataset
     archetype_df: optional; only used to report role coverage
     """
 
@@ -251,10 +256,14 @@ def run_checks(
 
     years = list(years or AUCTION_DATES)
 
+    if player_template is None:
+        player_template = default_player_template()
+    if bid_template is None:
+        bid_template = default_bid_template()
     if bbb_dir is None:
-        bbb_dir = DEFAULT_BBB_DIR
-    if resolution is None and os.path.exists(DEFAULT_RESOLUTION):
-        resolution = DEFAULT_RESOLUTION
+        bbb_dir = default_bbb_dir()
+    if resolution is None:
+        resolution = default_resolution()
 
     # A path to a single .parquet is the old interface and the most
     # common thing to get wrong when moving this to Kaggle; say so
@@ -263,9 +272,9 @@ def run_checks(
     if str(bbb_dir).endswith(".parquet") or os.path.isfile(bbb_dir):
         raise NotADirectoryError(
             f"bbb_dir={bbb_dir!r} is a single parquet file. This pipeline "
-            f"needs the DIRECTORY written by data.build_bbb, holding "
-            f"deliveries/fielding/people parquet. The cloned repo ships "
-            f"one at data/bbb -- leave bbb_dir=None to use it."
+            f"needs the DIRECTORY written by pipelines.build_bbb, holding "
+            f"deliveries/fielding/people parquet. Leave bbb_dir=None and it "
+            f"is resolved from the inputs Kaggle dataset."
         )
 
     print("=" * 72)

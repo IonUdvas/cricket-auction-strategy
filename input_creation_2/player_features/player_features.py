@@ -182,7 +182,7 @@ class PlayerStatsAggregator:
     Parameters
     ----------
     deliveries : DataFrame
-        Output of data_prep.build_bbb (deliveries.parquet).
+        Output of pipelines.build_bbb (deliveries.parquet).
     competitions : iterable of str, optional
         Restrict to these `competition` values.  `None` uses everything.
     fielding : DataFrame, optional
@@ -552,7 +552,7 @@ class PlayerStatsAggregator:
                 f"{unmatched} fielding rows sit in a kept match but an innings "
                 f"with no deliveries, e.g. {sample}. deliveries and fielding "
                 f"were filtered inconsistently at build time; rebuild with "
-                f"data/build_bbb.py rather than dropping them here."
+                f"pipelines/build_bbb.py rather than dropping them here."
             )
 
         player_code = f["fielder_id"].map(self._code_of).to_numpy().astype(np.int32)
@@ -684,7 +684,7 @@ def _batting_metrics(b):
             b["control_balls"] - b["controlled"], b["control_balls"]),
         # Share of *shots actually made* that went in the air.  The
         # denominator excludes plays-and-misses, leaves and hit-pads; see
-        # data/build_shot_attributes.py.
+        # pipelines/build_shot_attributes.py.
         "aerial_percentage": _ratio(b["aerial"], b["elev_balls"]),
     }
     for ph in PHASES:

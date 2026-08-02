@@ -195,10 +195,15 @@ def test_untagged_player_never_reads_as_wanted(tags):
 # -- real table -------------------------------------------------------------
 
 def test_real_archetype_table_builds():
-    path = os.path.join(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__))), "data", "auction", "player_archetypes.csv")
-    if not os.path.exists(path):
-        pytest.skip("player_archetypes.csv not present")
+    # The repo carries no data, so this only runs where the inputs Kaggle
+    # dataset is mounted or CRICKET_DATA_DIR points at a local copy.
+    # Skipping is the correct outcome everywhere else; the pure-logic tests
+    # above cover the tagging rules without needing the table.
+    import data_sources as ds
+    path = ds.archetypes_path(required=False)
+    if not path:
+        pytest.skip("player_archetypes.csv not reachable "
+                    "(attach the inputs dataset or set CRICKET_DATA_DIR)")
     tags = A.build_archetype_tags(pd.read_csv(path))
     assert len(tags) > 700
     # Every player lands in at least one bucket.

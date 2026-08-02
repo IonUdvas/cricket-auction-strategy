@@ -36,7 +36,8 @@ def load_deliveries(bbb_dir=None, with_shot_quality=True, columns=None,
     ----------
     bbb_dir : str, optional
         Directory holding deliveries.parquet.  Resolved via `data_sources`
-        when omitted, which finds it under /kaggle/input or in the repo.
+        when omitted, which finds it in the mounted Kaggle inputs dataset or
+        in /kaggle/working if it was rebuilt this session.
     with_shot_quality : bool
         Merge ball_attributes if it can be found.  When it cannot, this is a
         no-op and the caller gets the plain delivery table -- the aggregator
@@ -66,9 +67,15 @@ def load_deliveries(bbb_dir=None, with_shot_quality=True, columns=None,
     if not with_shot_quality:
         return deliveries
 
+    # ball_attributes is BUILT, not stored: build_shot_attributes writes it
+    # into /kaggle/working/bbb during a session, while deliveries.parquet is
+    # mounted read-only from the dataset. Assuming the two live together is
+    # the obvious shortcut and it silently drops shot quality on exactly the
+    # setup this pipeline runs in -- so a miss next to deliveries falls
+    # through to a full search, which puts /kaggle/working first.
     path = attributes_path or os.path.join(bbb_dir, "ball_attributes.parquet")
     if not os.path.exists(path):
-        path = ds.find_file("ball_attributes.parquet", required=False)
+        path = ds.ball_attributes_path()
     if not path:
         return deliveries
 
@@ -82,7 +89,7 @@ def load_deliveries(bbb_dir=None, with_shot_quality=True, columns=None,
         raise ValueError(
             f"ball_attributes has {dupes} duplicated {KEYS} rows; the merge "
             f"below would multiply deliveries. Rebuild with "
-            f"data/build_shot_attributes.py."
+            f"pipelines/build_shot_attributes.py."
         )
 
     before = len(deliveries)

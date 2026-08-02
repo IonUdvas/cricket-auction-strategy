@@ -8,9 +8,10 @@ number you can look at, per year.
 
 Usage
 -----
-    python -m tests.audit_auction_data \\
-        --players "path/to/players_{year}.csv" \\
-        --bids    "path/to/bids_{year}.csv"
+    python -m tests.audit_auction_data
+
+--players and --bids default to the auction Kaggle dataset; pass them only to
+audit files from somewhere else.
 
 Exit code is non-zero if any BLOCKER fires.
 """
@@ -22,7 +23,12 @@ import numpy as np
 import pandas as pd
 
 from input_creation_2.auction_replay_engine import AuctionReplayEngine
-from src.training import AUCTION_DATES, AUCTION_MAX_PURSES
+from src.training import (
+    AUCTION_DATES,
+    AUCTION_MAX_PURSES,
+    default_bid_template,
+    default_player_template,
+)
 
 
 class Report:
@@ -436,8 +442,12 @@ def audit_feature_blocks(training_df, report):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--players", required=True, help="template with {year}")
-    parser.add_argument("--bids", required=True, help="template with {year}")
+    parser.add_argument("--players", default=None,
+                        help="template with {year}; defaults to the auction "
+                             "Kaggle dataset")
+    parser.add_argument("--bids", default=None,
+                        help="template with {year}; defaults to the auction "
+                             "Kaggle dataset")
     parser.add_argument(
         "--years",
         nargs="*",
@@ -446,14 +456,17 @@ def main():
     )
     args = parser.parse_args()
 
+    players = args.players or default_player_template()
+    bids = args.bids or default_bid_template()
+
     report = Report()
 
     for year in args.years:
         try:
             audit_year(
                 year,
-                args.players.format(year=year),
-                args.bids.format(year=year),
+                players.format(year=year),
+                bids.format(year=year),
                 report,
             )
         except Exception as exc:  # noqa: BLE001
