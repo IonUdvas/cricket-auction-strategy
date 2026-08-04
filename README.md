@@ -110,8 +110,6 @@ input_creation_2/     replay engine, player features, identity resolution
 valuation_model/      the model, losses, scaling, training loop
 src/                  training entry points, checks, multi-seed experiments
 tests/                pytest suite + standalone audit scripts
-scripts/              staging and purge tooling
-older_versions/       superseded code, kept for reference
 ```
 
 `pipelines/` was called `data/`. It was renamed because a directory called

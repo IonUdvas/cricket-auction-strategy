@@ -1,0 +1,82 @@
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Test / coverage / type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Jupyter / IPython
+.ipynb_checkpoints
+profile_default/
+ipython_config.py
+
+# Environments
+.env
+.envrc
+.venv
+env/
+venv/
+ENV/
+
+# Editors
+.idea/
+.vscode/
+.spyderproject
+.ropeproject
+tempCodeRunnerFile.py
+
+# OS
+.DS_Store
+Thumbs.db
+
+###############################################################################
+# DATA -- none of this belongs in the repository
+#
+# Every byte of data lives in a Kaggle Dataset. See data_sources.DATASETS and
+# README.md. These rules are a backstop, not the mechanism: the mechanism is
+# that no code path resolves a data file against the repo any more, so a file
+# dropped here is never read even if it is never committed.
+###############################################################################
+
+# The old data tree. `data/` is now `pipelines/` and holds code only.
+data/
+/outputs/
+/kaggle-upload/
+
+# Raw / built data by type, wherever it lands.
+*.parquet
+*.pq
+*_json.zip
+*.csv
+*.csv.gz
+*.tsv
+*.feather
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.pt
+*.pth
+*.ckpt
+
+# Not data: the only config the repo is allowed to carry.
+!configs/*.yaml
+
+# Leftover patch and diff artefacts -- the thing that started all this.
+*.patch
+*.orig
+*.rej

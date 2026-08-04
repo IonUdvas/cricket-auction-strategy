@@ -588,6 +588,7 @@ def build_training_samples(
     auction_date,
     auction_max_purse,
     player_context_columns=None,
+    archetype_df=None,
 ):
     """
     Build the complete training dataframe.
@@ -623,10 +624,27 @@ def build_training_samples(
     # Replay Auction
     ############################################################
 
+    ####################################################################
+    # archetype_df is what switches the engine from three coarse role
+    # counters (batters/bowlers/allrounders bought) to the twelve
+    # squad-construction archetypes, and it is what makes the
+    # supply/demand/scarcity block exist at all. Without it the engine
+    # silently falls back to the legacy counters -- which is how it ran
+    # for the whole history of this pipeline, because no call site ever
+    # passed the table.
+    #
+    # It must be the RAW archetype table, not the filtered role frame
+    # handed to build_role_table as player_role_df. build_archetype_tags
+    # needs `pace`, `RA` and `LA` to derive right_arm_pace/left_arm_pace,
+    # and the filtered frame drops them. Passing the wrong one raises
+    # rather than silently degrading, which is the intent.
+    ####################################################################
+
     engine = AuctionReplayEngine(
         bid_df=bid_df,
         player_df=player_df,
         auction_max_purse=auction_max_purse,
+        archetype_df=archetype_df,
     )
 
     outputs = engine.replay()

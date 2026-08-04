@@ -694,8 +694,10 @@ def describe():
         n = sum(len(f) for _, _, f in os.walk(stale))
         print(f"\n  WARNING: {stale} still exists and holds {n} files.")
         print("  It is ignored -- nothing below reads from it -- but it means")
-        print("  the history purge has not run yet, so every clone still")
-        print("  drags ~231 MB. See scripts/purge_data_from_history.sh.")
+        print("  this clone predates the history purge and still drags the old")
+        print("  data. Delete it and re-clone. Do NOT pull into a pre-purge")
+        print("  clone: the rewrite gave every commit a new hash, so a pull")
+        print("  merges the old history back in rather than replacing it.")
 
     print("\nsearch roots (in order):")
     for r in data_roots() or ["(nothing mounted)"]:

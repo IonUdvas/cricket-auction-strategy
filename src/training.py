@@ -191,6 +191,26 @@ def default_bid_template():
     """auction_trail_{year}.csv, from the auction dataset."""
     return ds.bid_template()
 
+
+def default_archetype_df():
+    """
+    The RAW player_archetypes.csv, for the replay engine.
+
+    Distinct from the `player_role_df` passed to build_role_table. That
+    one is filtered down to the tag columns that become the model's role
+    vector; this one must still carry `pace`, `RA` and `LA`, because
+    build_archetype_tags derives right_arm_pace / left_arm_pace from
+    their conjunction and asserts that every paced player has exactly
+    one arm set. Hand it the filtered frame and it raises.
+
+    Loaded by default rather than left to the caller: the engine's
+    archetype_df argument has existed since the archetype counters were
+    written and no call site ever passed it, so every model to date
+    trained on the three legacy role counters instead. A default that
+    has to be opted out of fails in the safer direction.
+    """
+    return pd.read_csv(ds.archetypes_path())
+
 AUCTION_DATES = {
     2018: "2018-01-27",
     2019: "2018-12-18",
@@ -225,6 +245,7 @@ def build_training_df(
         resolution=None,
         feature_context=None,
         player_context_columns=None,
+        archetype_df=None,
         verify=None,
         verify_strict=None,
 ):
@@ -314,6 +335,22 @@ def build_training_df(
             list(DEFAULT_PLAYER_CONTEXT_COLUMNS),
         )
 
+    ####################################################################
+    # The archetype table defaults to loading rather than to None.
+    #
+    # None is what every call site has effectively passed since the
+    # archetype counters were written, and the engine treats it as
+    # "use the legacy three role counters" without complaint. That
+    # default is the reason the supply/demand/scarcity block has never
+    # appeared in a training frame. Pass archetype_df=False to opt out
+    # deliberately -- distinct from None, which now means "load it".
+    ####################################################################
+
+    if archetype_df is None:
+        archetype_df = default_archetype_df()
+    elif archetype_df is False:
+        archetype_df = None
+
     data_cfg = config.get("data", {}) or {}
     if verify is None:
         verify = data_cfg.get("verify", True)
@@ -331,6 +368,7 @@ def build_training_df(
             auction_date,
             auction_max_purse=AUCTION_MAX_PURSES[year],
             player_context_columns=player_context_columns,
+            archetype_df=archetype_df,
         )
         training_dfs[year] = training_df
         print(f"Finished {year}: {len(training_df)} training rows")
@@ -432,13 +470,16 @@ def run_training_pipeline(
         bid_template=None,
         bbb_dir=None,
         player_role_df=None,
+        archetype_df=None,
 ):
     
     set_seed()
 
     # Left as None deliberately: build_training_df resolves them, so there is
     # exactly one place that knows the defaults.
-    full_training_df = build_training_df(player_template, bid_template, bbb_dir)
+    full_training_df = build_training_df(
+        player_template, bid_template, bbb_dir, archetype_df=archetype_df,
+    )
 
     ################################################################
     # Player roles, built once on the full concatenated frame -- see
@@ -529,6 +570,7 @@ def prepare_holdout_data(
         train_years=None,
         val_years=None,
         player_role_df=None,
+        archetype_df=None,
         competitions=None,
         overrides=None,
         resolution=None,
@@ -599,14 +641,18 @@ def prepare_holdout_data(
         for year in all_years
     })
 
+    # archetype_df goes to BOTH splits or the team/auction state blocks
+    # come out different widths and the cross-split attrs check below
+    # fires. It is threaded explicitly rather than left to each call's
+    # default so that opting out (archetype_df=False) opts both out.
     train_df = build_training_df(
         player_template, bid_template, bbb_dir, years=train_years,
-        feature_context=feature_context,
+        feature_context=feature_context, archetype_df=archetype_df,
     )
 
     val_df = build_training_df(
         player_template, bid_template, bbb_dir, years=val_years,
-        feature_context=feature_context,
+        feature_context=feature_context, archetype_df=archetype_df,
     )
 
     ################################################################
@@ -851,6 +897,7 @@ def run_training_pipeline_with_holdout(
         train_years=None,
         val_years=None,
         player_role_df=None,
+        archetype_df=None,
         competitions=None,
         overrides=None,
         resolution=None,
@@ -896,6 +943,7 @@ def run_training_pipeline_with_holdout(
             train_years=train_years,
             val_years=val_years,
             player_role_df=player_role_df,
+            archetype_df=archetype_df,
             competitions=competitions,
             overrides=overrides,
             resolution=resolution,

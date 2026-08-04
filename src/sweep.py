@@ -104,6 +104,22 @@ def _build_key(pipeline_kwargs, cfg):
     if role_df is not None:
         parts["role_columns"] = tuple(role_df.columns)
         parts["role_nrows"] = len(role_df)
+
+    # archetype_df switches the engine between the legacy three role
+    # counters and the twelve-archetype supply/demand/scarcity block, so
+    # it changes the WIDTH of the team-state and auction-state blocks.
+    # Omitting it from the key would let a cache warmed before the
+    # archetype wiring serve pre-archetype frames to a sweep that thinks
+    # it is measuring them -- a stale-cache bug that looks like a null
+    # result rather than like an error.
+    arch_df = pipeline_kwargs.get("archetype_df")
+    if arch_df is False:
+        parts["archetypes"] = "disabled"
+    elif arch_df is None:
+        parts["archetypes"] = "default"
+    else:
+        parts["archetypes"] = (tuple(arch_df.columns), len(arch_df))
+
     return json.dumps(parts, sort_keys=True, default=str)
 
 
