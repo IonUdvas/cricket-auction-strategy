@@ -249,3 +249,116 @@ def compare(named_frames, metrics=None):
         rows.append(row)
 
     return pd.DataFrame(rows)
+
+
+####################################################################
+# The auction adjustment
+#
+# The model's central claim is a decomposition: an intrinsic valuation
+# answering "who do we like", and a state-dependent multiplier phi
+# answering "how desperate are we". That claim is only worth making if
+# phi does something -- a model that learns log_phi ~ 0 everywhere has
+# an auction network that is decoration, and one that learns a constant
+# non-zero log_phi has merely rescaled mu.
+#
+# So the reportable facts about phi are, in order:
+#   1. Does it vary at all?              (spread, and share at the bound)
+#   2. Does it vary with auction state?  (trend across progress)
+#   3. Does it vary the way theory says? (higher early, lower late)
+#
+# Only (3) is the interesting claim, and it is only interesting after
+# (1) and (2) survive. Reporting a trend without first reporting the
+# spread invites the reader to assume a range that may not exist.
+####################################################################
+
+def log_phi_report(preds, n_bins=5, max_log_phi=None, by_year=False):
+    """
+    Summarise the learned auction adjustment.
+
+    preds : a predictions frame from evaluate_predictions, carrying
+            predicted_log_phi and at least one progress column.
+    max_log_phi : the tanh bound from the config, if you want the
+            saturation diagnostic. The adjustment is bounded by
+            max_log_phi * tanh(.), so mass piling up at +/- the bound
+            means the bound is binding and the reported range is an
+            artefact of the ceiling rather than a finding.
+
+    Returns (summary_dict, progress_table).
+    """
+    import numpy as _np
+    import pandas as _pd
+
+    if "predicted_log_phi" not in preds.columns:
+        raise ValueError(
+            "predicted_log_phi is absent. It is added by "
+            "evaluate_predictions; a frame built before that change must "
+            "be regenerated, or derived as "
+            "predicted_mu_effective - predicted_mu."
+        )
+
+    lp = preds["predicted_log_phi"].to_numpy(dtype=float)
+
+    summary = {
+        "n_rows": int(len(lp)),
+        "log_phi_mean": float(_np.mean(lp)),
+        "log_phi_sd": float(_np.std(lp)),
+        "log_phi_min": float(_np.min(lp)),
+        "log_phi_p05": float(_np.percentile(lp, 5)),
+        "log_phi_median": float(_np.median(lp)),
+        "log_phi_p95": float(_np.percentile(lp, 95)),
+        "log_phi_max": float(_np.max(lp)),
+        # phi at the median, as a multiplier -- the interpretable form.
+        "phi_median": float(_np.exp(_np.median(lp))),
+        "phi_p05": float(_np.exp(_np.percentile(lp, 5))),
+        "phi_p95": float(_np.exp(_np.percentile(lp, 95))),
+    }
+
+    if max_log_phi:
+        # Within 1% of the bound counts as saturated. If this is more
+        # than a few percent the tanh is clipping and the range below
+        # is a property of the ceiling, not of the auction.
+        at_bound = _np.mean(_np.abs(lp) > 0.99 * max_log_phi)
+        summary["max_log_phi"] = float(max_log_phi)
+        summary["frac_at_bound"] = float(at_bound)
+
+    # ---------------------------------------------------------------
+    # Trend across the auction.
+    # ---------------------------------------------------------------
+
+    progress_col = next(
+        (c for c in ("players_completed", "auction_order", "players_remaining")
+         if c in preds.columns),
+        None,
+    )
+    if progress_col is None:
+        return summary, None
+
+    frame = preds[[progress_col, "predicted_log_phi"]].copy()
+    if progress_col == "players_remaining":
+        # Flip so that larger always means "later in the auction".
+        frame[progress_col] = -frame[progress_col]
+    if by_year and "auction_year" in preds.columns:
+        frame["auction_year"] = preds["auction_year"].to_numpy()
+
+    frame["progress_bin"] = _pd.qcut(
+        frame[progress_col], q=n_bins, labels=False, duplicates="drop"
+    )
+
+    group = ["auction_year", "progress_bin"] if "auction_year" in frame else ["progress_bin"]
+    table = (
+        frame.groupby(group)["predicted_log_phi"]
+        .agg(n="size", mean="mean", sd="std", median="median")
+        .reset_index()
+    )
+    table["phi_median"] = _np.exp(table["median"])
+
+    # Rank correlation rather than a slope: the theoretical claim is
+    # monotone ("higher earlier, lower later"), not linear, and a
+    # Pearson slope on a bounded tanh output is not the right test.
+    from scipy.stats import spearmanr
+    rho, p = spearmanr(frame[progress_col], frame["predicted_log_phi"])
+    summary["progress_column"] = progress_col
+    summary["spearman_progress_vs_log_phi"] = float(rho)
+    summary["spearman_p"] = float(p)
+
+    return summary, table

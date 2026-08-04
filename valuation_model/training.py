@@ -313,6 +313,22 @@ def evaluate_predictions(
     mean_log_value = np.clip(mu_effective + 0.5 * sigma ** 2, a_min=None, a_max=700.0)
     predicted_mean_value = np.exp(mean_log_value)
 
+    ########################################################
+    # Metadata carried through to the comparison frame.
+    #
+    # The auction-progress and team-state columns are here so that
+    # log_phi can be analysed against the state it is a function of.
+    # Without them the adjustment is a number with nothing to plot it
+    # against, and the claim that it rises early and falls late is
+    # untestable from the predictions frame alone.
+    #
+    # auction_year is needed to pool several holdout seasons into one
+    # frame and still separate them.
+    #
+    # Every name is guarded by the membership test below, so listing a
+    # column that a given build does not produce is harmless.
+    ########################################################
+
     metadata_columns = [
         c for c in [
             "playerName",
@@ -323,6 +339,18 @@ def evaluate_predictions(
             "playsForTeam",
             "auctionStatus",
             "observation_type",
+
+            "auction_year",
+
+            # Auction progress -- the x-axis for any log_phi analysis.
+            "auction_order",
+            "players_completed",
+            "players_remaining",
+
+            # Team state -- the "how desperate are we" side of phi.
+            "remaining_purse",
+            "remaining_slots",
+            "players_bought",
         ]
         if c in dataset.training_df.columns
     ]
@@ -339,6 +367,19 @@ def evaluate_predictions(
 
     comparison["predicted_mu"] = preds["mu"]
     comparison["predicted_mu_effective"] = mu_effective
+
+    ########################################################
+    # The auction adjustment itself.
+    #
+    # log_phi = mu_effective - mu by construction, so this adds no
+    # information -- but it is the quantity the model is built around
+    # ("who do we like" vs "how desperate are we"), and requiring every
+    # analysis to re-derive it invites sign errors. phi is the
+    # multiplicative form: phi > 1 means bidding above intrinsic value.
+    ########################################################
+
+    comparison["predicted_log_phi"] = mu_effective - preds["mu"]
+    comparison["predicted_phi"] = np.exp(comparison["predicted_log_phi"])
     comparison["predicted_sigma"] = sigma
     comparison["predicted_median_value"] = predicted_median_value
     comparison["predicted_mean_value"] = predicted_mean_value
