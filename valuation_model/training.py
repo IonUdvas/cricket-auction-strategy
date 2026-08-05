@@ -351,6 +351,20 @@ def evaluate_predictions(
             "remaining_purse",
             "remaining_slots",
             "players_bought",
+
+            # Whether the player is priceable at all. A debutant with no
+            # senior record and no prior auction price is not a player the
+            # model got wrong; he is a player no performance-conditioned
+            # model can price, and pooling him into an error statistic
+            # understates the model on players it can actually see. These
+            # are the flags that split that subset out.
+            "last_salary_is_missing",
+            "age_is_missing",
+            "last_salary",
+            "age",
+            "cappedStatus",
+            "isPlayerOverseas",
+            "untagged",
         ]
         if c in dataset.training_df.columns
     ]
