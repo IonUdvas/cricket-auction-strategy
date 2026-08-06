@@ -12,6 +12,7 @@ class IPLAuctionDataset(Dataset):
         training_df,
         encoder_manager,
         scalers=None,
+        weighting="balanced",
     ):
         """
         scalers : dict of BlockScaler, keyed by attrs group name, as
@@ -19,7 +20,45 @@ class IPLAuctionDataset(Dataset):
                   Fit on the TRAIN frame and passed to both datasets.
                   None keeps the old raw-feature behaviour, which is
                   only ever right for a smoke test -- see scaling.py.
+
+        weighting : "balanced" or "uniform".
+
+            "balanced" is the class-balanced scheme documented below
+            and is what training wants.
+
+            "uniform" gives every row weight 1.0, and is what a
+            VALIDATION set wants. The balanced weights are derived
+            from price brackets cut on each dataset's OWN interval
+            midpoints -- and for a winner the interval is [P, kP), so
+            the bracket is a function of the label. Applying them to
+            the validation set makes the reported "validation NLL" a
+            label-reweighted quantity whose weights are refitted on
+            every split, which has two consequences worth knowing
+            before quoting it:
+
+              1. It is not comparable across editions. A 182-sale
+                 mega auction and a 77-sale small one produce
+                 different strata and therefore different weights, so
+                 2.51 on one and 2.66 on the other are not two
+                 measurements of the same thing.
+
+              2. Early stopping is driven by it. The epoch chosen is
+                 the epoch that minimises a reweighting of the
+                 validation labels, not the validation likelihood.
+
+            That is a large part of why validation NLL has ranked
+            configurations differently from every point-estimate
+            metric. Set training.valid_loss_weighting: uniform in the
+            config to score and stop on the plain held-out likelihood
+            instead.
         """
+
+        if weighting not in ("balanced", "uniform"):
+            raise ValueError(
+                f"weighting must be 'balanced' or 'uniform', got "
+                f"{weighting!r}"
+            )
+        self.weighting = weighting
 
         self.training_df = training_df.copy()
 
@@ -184,65 +223,72 @@ class IPLAuctionDataset(Dataset):
         # contributing equally, without that runaway effect.
         ########################################################
 
-        log_midpoint = np.log(
-            np.clip(
-                (
-                    self.training_df["lower"].to_numpy(dtype=np.float64)
-                    + self.training_df["upper"].to_numpy(dtype=np.float64)
-                )
-                / 2.0,
-                1e-3,
-                None,
+        if self.weighting == "uniform":
+            # Every row counts once. See the docstring: the balanced
+            # weights below are cut on label-derived price brackets,
+            # which is right for training and wrong for scoring.
+            self.sample_weight = torch.ones(
+                len(self.training_df), dtype=torch.float32
             )
-        )
-
-        num_price_bins = 6
-
-        def _bin_within_type(group):
-            try:
-                return pd.qcut(
-                    group,
-                    q=num_price_bins,
-                    labels=False,
-                    duplicates="drop",
+        else:
+            log_midpoint = np.log(
+                np.clip(
+                    (
+                        self.training_df["lower"].to_numpy(dtype=np.float64)
+                        + self.training_df["upper"].to_numpy(dtype=np.float64)
+                    )
+                    / 2.0,
+                    1e-3,
+                    None,
                 )
-            except (ValueError, IndexError):
-                # Too few rows/unique values in this observation_type
-                # to form quantile bins (e.g. a small validation
-                # split) -- collapse to a single price bracket for
-                # that type.
-                return pd.Series(
-                    np.zeros(len(group), dtype=int),
-                    index=group.index,
-                )
+            )
 
-        price_bin = (
-            pd.Series(log_midpoint, index=self.training_df.index)
-            .groupby(self.training_df["observation_type"])
-            .transform(_bin_within_type)
-        )
+            num_price_bins = 6
 
-        strata = (
-            self.training_df["observation_type"].astype(str)
-            + "_"
-            + pd.Series(price_bin, index=self.training_df.index).astype(str)
-        )
+            def _bin_within_type(group):
+                try:
+                    return pd.qcut(
+                        group,
+                        q=num_price_bins,
+                        labels=False,
+                        duplicates="drop",
+                    )
+                except (ValueError, IndexError):
+                    # Too few rows/unique values in this observation_type
+                    # to form quantile bins (e.g. a small validation
+                    # split) -- collapse to a single price bracket for
+                    # that type.
+                    return pd.Series(
+                        np.zeros(len(group), dtype=int),
+                        index=group.index,
+                    )
 
-        strata_counts = strata.value_counts()
+            price_bin = (
+                pd.Series(log_midpoint, index=self.training_df.index)
+                .groupby(self.training_df["observation_type"])
+                .transform(_bin_within_type)
+            )
 
-        num_strata = len(strata_counts)
-        total_rows = len(self.training_df)
+            strata = (
+                self.training_df["observation_type"].astype(str)
+                + "_"
+                + pd.Series(price_bin, index=self.training_df.index).astype(str)
+            )
 
-        strata_weight = {
-            key: total_rows / (num_strata * count)
-            for key, count in strata_counts.items()
-        }
+            strata_counts = strata.value_counts()
 
-        self.sample_weight = torch.tensor(
-            strata.map(strata_weight).to_numpy(dtype=np.float32),
+            num_strata = len(strata_counts)
+            total_rows = len(self.training_df)
 
-            dtype=torch.float32,
-        )
+            strata_weight = {
+                key: total_rows / (num_strata * count)
+                for key, count in strata_counts.items()
+            }
+
+            self.sample_weight = torch.tensor(
+                strata.map(strata_weight).to_numpy(dtype=np.float32),
+                dtype=torch.float32,
+            )
 
         ########################################################
         # Targets

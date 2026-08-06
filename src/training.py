@@ -369,6 +369,10 @@ def build_training_df(
             auction_max_purse=AUCTION_MAX_PURSES[year],
             player_context_columns=player_context_columns,
             archetype_df=archetype_df,
+            # The SEASON, not the calendar year of auction_date. The
+            # two differ for every edition auctioned in December --
+            # see the note in build_training_samples.
+            auction_season=year,
         )
         training_dfs[year] = training_df
         print(f"Finished {year}: {len(training_df)} training rows")
@@ -730,9 +734,48 @@ def prepare_holdout_data(
     # prices, and no train row can see anything from a val year.
     ################################################################
 
+    ################################################################
+    # The earnings tables are the salary source, when they resolve.
+    #
+    # data_sources has exposed earnings_template() all along and
+    # nothing called it. The auction trail alone cannot see a retained
+    # player's money -- the replay engine removes retentions from the
+    # pool before emitting rows -- so last_salary was missing for
+    # exactly the established players it matters most for.
+    ################################################################
+
+    earnings_frames = None
+    try:
+        template = ds.earnings_template(required=False)
+    except Exception:
+        template = None
+
+    if template:
+        seasons = sorted(set(list(train_years) + list(val_years)))
+        loaded = []
+        for season in seasons:
+            path = template.format(year=season)
+            if os.path.exists(path):
+                loaded.append(pd.read_csv(path))
+        if loaded:
+            earnings_frames = loaded
+        else:
+            print(
+                "  earnings template resolved but no file matched; "
+                "falling back to auction-trail prices, which cannot see "
+                "retentions."
+            )
+    else:
+        print(
+            "  no earnings tables found -- last_salary will come from the "
+            "auction trail only and every retained player will look like a "
+            "debutant."
+        )
+
     demo_frame, demo_columns = build_demographic_features(
         combined_df,
         player_role_df=player_role_df,
+        earnings_frames=earnings_frames,
     )
 
     # Preserve existing attrs 
@@ -816,8 +859,37 @@ def train_from_prepared(prepared, seed=None, scale_features=None):
             "scaling.py."
         )
 
+    ################################################################
+    # Validation weighting.
+    #
+    # The train dataset is always class-balanced -- that is what the
+    # weighting is for. The validation dataset has been balanced too,
+    # by nothing more than both datasets going through the same
+    # constructor, and that is a reporting bug rather than a choice:
+    # the strata are cut on each split's own interval midpoints, and
+    # a winner's interval is [P, kP), so the weights are a function
+    # of the labels and are refitted per split. "Validation NLL" has
+    # therefore been a label-reweighted number that is not comparable
+    # across editions, and early stopping has been minimising it.
+    #
+    # Default stays "balanced" so that nothing changes silently
+    # underneath existing results. Set
+    #
+    #     training:
+    #       valid_loss_weighting: uniform
+    #
+    # to stop and report on the plain held-out likelihood, which is
+    # what the paper means by validation NLL.
+    ################################################################
+
+    valid_weighting = (
+        config.get("training", {}).get("valid_loss_weighting", "balanced")
+    )
+
     train_dataset = IPLAuctionDataset(train_df, encoder_manager, scalers=scalers)
-    val_dataset = IPLAuctionDataset(val_df, encoder_manager, scalers=scalers)
+    val_dataset = IPLAuctionDataset(
+        val_df, encoder_manager, scalers=scalers, weighting=valid_weighting,
+    )
 
     train_loader = DataLoader(
         train_dataset,

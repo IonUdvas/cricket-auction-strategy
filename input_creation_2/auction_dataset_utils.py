@@ -589,6 +589,7 @@ def build_training_samples(
     auction_max_purse,
     player_context_columns=None,
     archetype_df=None,
+    auction_season=None,
 ):
     """
     Build the complete training dataframe.
@@ -725,7 +726,56 @@ def build_training_samples(
     # the model.
     ############################################################
 
-    training_df["auction_year"] = int(pd.to_datetime(auction_date).year)
+    ################################################################
+    # auction_year is the SEASON, not the calendar year the auction
+    # was held in.
+    #
+    # This used to read int(pd.to_datetime(auction_date).year), and
+    # the IPL auction is held in the calendar year BEFORE the season
+    # it fills for six of the nine editions here:
+    #
+    #     season 2018 -> 2018-01-27 -> 2018
+    #     season 2019 -> 2018-12-18 -> 2018   <-- collides with 2018
+    #     season 2020 -> 2019-12-19 -> 2019
+    #     season 2023 -> 2022-12-23 -> 2022   <-- collides with 2022
+    #     season 2026 -> 2025-12-16 -> 2025
+    #
+    # Two pairs of editions therefore collapsed onto one label, and
+    # build_demographic_features de-duplicates its price table on
+    # (playerId, auction_year) -- so one price per colliding player
+    # was silently discarded, 63 of them, always the LATER and
+    # therefore more informative of the two. It also broke the
+    # strictly-before join it feeds: a season-2019 row looking for a
+    # price strictly before 2018 could not see the season-2018
+    # auction, because both were stamped 2018. A whole edition was
+    # unusable as history for the edition that immediately followed
+    # it.
+    #
+    # The visible symptom was a build log reporting paid pairs across
+    # [2018, 2019, 2021, 2022, 2023, 2024, 2025] -- no 2020, no 2026
+    # -- which reads as missing data and is in fact mislabelling.
+    #
+    # The season is passed in explicitly rather than inferred from
+    # the date, because there is no rule that infers it: the gap
+    # between auction and season is not constant (2018 and 2021 were
+    # in-year, the rest were not).
+    ################################################################
+
+    if auction_season is None:
+        auction_season = int(pd.to_datetime(auction_date).year)
+        print(
+            "  WARNING: build_training_samples called without "
+            "auction_season, falling back to the calendar year of "
+            f"{auction_date}. For any edition auctioned in December "
+            "this labels the frame with the wrong season and will "
+            "collide with the preceding one. Pass the season."
+        )
+
+    training_df["auction_year"] = int(auction_season)
+    training_df["auction_season"] = int(auction_season)
+    training_df["auction_calendar_year"] = int(
+        pd.to_datetime(auction_date).year
+    )
     training_df["auction_date"] = pd.to_datetime(auction_date)
 
     # verify_year() reads this. Attached rather than returned so the
@@ -739,6 +789,8 @@ def build_training_samples(
         "team",
 
         "auction_year",
+        "auction_season",
+        "auction_calendar_year",
         "auction_date",
 
         "country",
@@ -1066,6 +1118,7 @@ def build_demographic_features(
     player_role_df=None,
     paid_statuses=PAID_AUCTION_STATUSES,
     verbose=True,
+    earnings_frames=None,
 ):
     """
     Build the age / last-salary block for an already-concatenated frame.
@@ -1176,9 +1229,21 @@ def build_demographic_features(
         # would repeat each price ~10 times. merge_asof would still pick
         # a correct value, but every count and every diagnostic below
         # would be off by the number of teams.
-        paid = training_df[["playerId", "auction_year",
+        ############################################################
+        # Keyed on auction_date, not on a year label.
+        #
+        # The date is the only column that is both unique per edition
+        # and correctly ordered. A year label is neither when two
+        # auctions fall in one calendar year, and merge_asof with
+        # allow_exact_matches=False then hides the earlier edition
+        # from the later one instead of feeding it forward. Dates are
+        # 2018-01-27 and 2018-12-18, and strictly-before on those is
+        # exactly the intended rule.
+        ############################################################
+
+        paid = training_df[["playerId", "auction_date", "auction_year",
                             "auctionPrice", "auctionStatus"]].copy()
-        paid = paid.drop_duplicates(["playerId", "auction_year"])
+        paid = paid.drop_duplicates(["playerId", "auction_date"])
 
         observed = sorted(
             str(s).upper()
@@ -1188,13 +1253,36 @@ def build_demographic_features(
                  | {s.upper() for s in UNPAID_AUCTION_STATUSES})
         unrecognised = [s for s in observed if s not in known]
 
-        salary_history = demog.build_salary_history(
-            paid,
-            id_column="playerId",
-            year_column="auction_year",
-            price_column="auctionPrice",
-            sold_statuses=paid_statuses,
-        )
+        ########################################################
+        # Prefer the earnings tables when they are available.
+        #
+        # The auction trail can only report players who went under
+        # the hammer, so a retained player's money is invisible to it
+        # and he re-enters a later auction as a debutant. The
+        # earnings files carry the retention seasons and roughly
+        # three times as many (player, season) salaries overall.
+        #
+        # Both sources are keyed on the SEASON, which is what
+        # auction_year now holds -- see the note in
+        # build_training_samples. Season ordering is what the
+        # strictly-before rule needs, and unlike the calendar year it
+        # never collides.
+        ########################################################
+
+        salary_source = "auction trail"
+        if earnings_frames is not None:
+            salary_history = demog.build_salary_history_from_earnings(
+                earnings_frames
+            )
+            salary_source = "earnings tables"
+        else:
+            salary_history = demog.build_salary_history(
+                paid,
+                id_column="playerId",
+                year_column="auction_year",
+                price_column="auctionPrice",
+                sold_statuses=paid_statuses,
+            )
 
         with_salary = demog.add_last_salary_feature(
             keys,
@@ -1208,13 +1296,86 @@ def build_demographic_features(
             with_salary["last_salary_is_missing"].to_numpy()
         )
 
+        # edition date -> season label, for human-readable reporting
+        season_of_date = (
+            paid.drop_duplicates("auction_date")
+            .set_index("auction_date")["auction_year"]
+            .to_dict()
+        )
+
         has = demo_frame["last_salary_is_missing"] == 0
         line = (
             f"last_salary: {int(has.sum())}/{len(demo_frame)} rows have a "
             f"prior price ({has.mean():.1%}); "
             f"{len(salary_history)} paid (player, auction) pairs across "
-            f"{[int(y) for y in sorted(salary_history['year'].unique())]}"
+            f"{sorted(int(y) for y in salary_history['year'].unique())}"
+            f" [source: {salary_source}]"
         )
+
+        ############################################################
+        # Per-edition breakdown, and a warning for any edition in the
+        # frame that contributed NOTHING.
+        #
+        # The summary line above reports which years produced paid
+        # pairs, and a reader naturally skims it. A year silently
+        # absent from that list is the expensive failure: every
+        # player priced in it becomes a debutant in every later
+        # auction, which suppresses last_salary -- the single most
+        # predictive feature in the block -- for a whole cohort, and
+        # shows up downstream as marquee players the model cannot
+        # price rather than as an error.
+        #
+        # A zero here is a data problem (an auctionStatus spelling,
+        # a null price column), not a modelling one, and it needs to
+        # be visible at build time rather than inferred from a
+        # residual plot.
+        ############################################################
+
+        # Label editions by season for the reader, but identify them
+        # by date, since that is what the join uses.
+        seasons_in_frame = {
+            int(y) for y in paid["auction_year"].dropna().unique()
+        }
+        priced = (
+            salary_history.groupby("year").size().to_dict()
+            if len(salary_history) else {}
+        )
+        seasons_with_prices = {int(y) for y in priced}
+
+        line += (
+            "\n      priced players by season: "
+            + ", ".join(
+                f"{s}:{priced.get(s, 0)}"
+                for s in sorted(seasons_in_frame)
+            )
+        )
+
+        silent = sorted(seasons_in_frame - seasons_with_prices)
+        if silent:
+            line += (
+                f"\n      WARNING: edition(s) {silent} are in the frame but "
+                f"contributed ZERO paid (player, auction) pairs. Every "
+                f"player whose most recent price came from one of them is "
+                f"now treated as having no prior price at all. Check "
+                f"auctionStatus spellings and auctionPrice nulls for those "
+                f"years before trusting last_salary."
+            )
+
+        ############################################################
+        # Retentions are invisible to this table by construction.
+        #
+        # salary_history is built from the training frame, and the
+        # training frame is one row per (auctioned player, team). A
+        # player retained rather than re-auctioned never appears, so
+        # his retention money is not a price this function can see --
+        # and when he next goes under the hammer he arrives as a
+        # debutant. That is why established internationals turn up
+        # with last_salary_is_missing = 1.
+        #
+        # Fixing it needs a retention source outside the auction
+        # trail, so this is a statement of a known limit rather than
+        # a check that can pass.
+        ############################################################
         if unrecognised:
             ############################################################
             # A status this list does not know is a player treated as

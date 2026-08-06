@@ -19,6 +19,39 @@ import re
 from input_creation_2.auction_order import resolve_auction_order
 
 
+####################################################################
+# The artificial upper bound on a winning observation.
+#
+# A winner tells us the buyer valued the player at AT LEAST the
+# hammer price. It says nothing about the ceiling, so the row is
+# right-censored and the interval needs some finite upper end for the
+# likelihood to be computable. This constant is that end, as a
+# multiple of the price: [P, WINNER_UPPER_MULTIPLE * P).
+#
+# It is a MODELLING CHOICE, not a fact about the auction, and it is
+# the leading suspect for top-of-market compression: the likelihood
+# is indifferent between any prediction inside the band and penalises
+# predictions above it, so a larger multiple is what lets the model
+# chase a marquee price. That makes it something to sweep.
+#
+# It lives at module scope, and _winner_upper_bound reads it through
+# the module namespace at CALL time rather than binding it in
+# __init__, precisely so that
+#
+#     import input_creation_2.auction_replay_engine as eng
+#     eng.WINNER_UPPER_MULTIPLE = 3.0
+#
+# actually changes the next build. Before this existed the value was
+# the literal 2 inside _winner_upper_bound, and that assignment
+# created a new module attribute nobody read -- a sweep over it
+# returned four identical rows and looked like a null result rather
+# than like a broken experiment.
+#
+# If you set this, remember the data cache: src.sweep keys builds on
+# it (see _build_key), but any cache of your own must be cleared.
+####################################################################
+WINNER_UPPER_MULTIPLE = 2.0
+
 
 class AuctionReplayEngine:
     """
@@ -667,8 +700,25 @@ class AuctionReplayEngine:
         """
         Returns the artificial upper bound used for
         right-censored winner observations.
+
+        The multiple is read from the module global on every call, so
+        monkeypatching WINNER_UPPER_MULTIPLE takes effect on the next
+        build. Do NOT cache it on self: an engine constructed before
+        the assignment would keep the old value and the sweep would
+        silently measure nothing.
         """
-        return winning_bid * 2
+        multiple = globals().get("WINNER_UPPER_MULTIPLE", 2.0)
+
+        if not multiple or multiple <= 1.0:
+            raise ValueError(
+                f"WINNER_UPPER_MULTIPLE must be > 1 (got {multiple!r}). "
+                f"A multiple of 1 collapses the winner interval to a "
+                f"point, and <1 inverts it; the loss clamps both to "
+                f"lower + 1e-3 and the row becomes a near-certain "
+                f"assertion carrying a huge NLL."
+            )
+
+        return winning_bid * multiple
     
     def _extract_team_bid_history(
         self,

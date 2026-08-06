@@ -452,6 +452,35 @@ def evaluate_predictions(
             comparison["predicted_median_value"] - comparison["auctionPrice"]
         )
 
+    ########################################################
+    # The bounds THIS model was built with, carried on the frame.
+    #
+    # sigma_saturation is mean(sigma) / sigma_max and log_phi
+    # saturation is measured against max_log_phi, so both diagnostics
+    # need a ceiling. Reading it from the live global config at
+    # reporting time -- which is what summarize_predictions used to
+    # do -- gives the right answer only if the config still holds the
+    # values the model was constructed under. It does not in the one
+    # case that matters: an ablation that overrides sigma_max inside
+    # a try/finally restores the config before the metrics are
+    # computed, so a run with a ceiling of 1.0 was scored against
+    # 1.5 and its saturation came out as 0.65 when the model was in
+    # fact pinned at 0.98 of its own ceiling. The ablation that was
+    # supposed to detect hedging reported the opposite.
+    #
+    # attrs travels with the frame, so the number is now the model's
+    # own and cannot drift from it.
+    ########################################################
+
+    intrinsic = getattr(model, "intrinsic", model)
+    comparison.attrs["sigma_min"] = float(getattr(intrinsic, "sigma_min", 0.05))
+    comparison.attrs["sigma_ceiling"] = float(getattr(intrinsic, "sigma_max", 1.5))
+    auction = getattr(model, "auction", None)
+    if auction is not None:
+        comparison.attrs["max_log_phi"] = float(
+            getattr(auction, "max_log_phi", 1.5)
+        )
+
     return comparison
 
 

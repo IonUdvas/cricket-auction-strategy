@@ -98,13 +98,43 @@ def summarize_predictions(preds, history=None):
         / np.clip(won["auctionPrice"], 1e-3, None)
     )
 
+    ################################################################
+    # Bias and dispersion are separate numbers and must be computed
+    # separately.
+    #
+    # `winner_mad_log_ratio` was median(|log_ratio|) -- the median
+    # absolute log-ratio, taken about ZERO. That is not a median
+    # absolute deviation, and it is not a dispersion measure at all:
+    # a model that is uniformly 30% high with no scatter whatsoever
+    # scores 0.262 on it, identical to a perfectly unbiased model
+    # whose errors are +/-30%. It therefore double-counts whatever
+    # `winner_median_log_ratio` already reports, and every comparison
+    # made on it has been a comparison of bias and spread summed
+    # together in unknown proportion.
+    #
+    # A true MAD is taken about the sample median, which is what the
+    # per-subset table in the analysis notebook already computed --
+    # so the two disagreed and the paper carried both under one name.
+    #
+    # Both are emitted now. The old quantity keeps its old definition
+    # under a name that says what it is, so previously recorded
+    # numbers remain checkable against `winner_median_abs_log_ratio`.
+    ################################################################
+
+    median_log_ratio = float(np.median(log_ratio))
+
     out = {
         "n_winners": int(len(won)),
         "winner_within_interval": float(won["within_interval"].mean()),
         "winner_medAE": float(error.abs().median()),
         "winner_meanAE": float(error.abs().mean()),
-        "winner_median_log_ratio": float(np.median(log_ratio)),
-        "winner_mad_log_ratio": float(np.median(np.abs(log_ratio))),
+        "winner_median_log_ratio": median_log_ratio,
+        # Dispersion about the median: |log_ratio - median|, medianed.
+        "winner_mad_log_ratio": float(
+            np.median(np.abs(log_ratio - median_log_ratio))
+        ),
+        # The pre-fix quantity, about zero: bias and spread combined.
+        "winner_median_abs_log_ratio": float(np.median(np.abs(log_ratio))),
         "winner_spearman": float(
             won["predicted_median_value"].corr(
                 won["auctionPrice"], method="spearman"
@@ -135,9 +165,23 @@ def summarize_predictions(preds, history=None):
     # pinned, the model is still hedging.
     ################################################################
 
-    sigma_ceiling = (
-        training_module.config.get("model", {}).get("sigma_max", 1.5)
-    )
+    # Prefer the ceiling the MODEL was built with, stamped onto the
+    # frame by evaluate_predictions. The config fallback is for
+    # frames produced before that change, and it is wrong whenever
+    # the config has been restored since the run -- see the note in
+    # evaluate_predictions.
+    sigma_ceiling = preds.attrs.get("sigma_ceiling")
+    if sigma_ceiling is None:
+        sigma_ceiling = (
+            training_module.config.get("model", {}).get("sigma_max", 1.5)
+        )
+        print(
+            "  NOTE: predictions frame carries no sigma_ceiling; falling "
+            "back to the live config's sigma_max "
+            f"({sigma_ceiling}). If this run overrode sigma_max and the "
+            "override has since been restored, sigma_saturation is being "
+            "computed against the wrong denominator."
+        )
     out["sigma_ceiling"] = float(sigma_ceiling)
     out["sigma_saturation"] = float(
         preds["predicted_sigma"].mean() / sigma_ceiling
@@ -297,6 +341,13 @@ def log_phi_report(preds, n_bins=5, max_log_phi=None, by_year=False):
         )
 
     lp = preds["predicted_log_phi"].to_numpy(dtype=float)
+
+    # The bound the model was actually built with, if the caller did
+    # not name one. Same reasoning as sigma_ceiling above: passing
+    # T.config["model"]["max_log_phi"] by hand is right only while the
+    # config still matches the run.
+    if max_log_phi is None:
+        max_log_phi = preds.attrs.get("max_log_phi")
 
     summary = {
         "n_rows": int(len(lp)),

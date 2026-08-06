@@ -20,6 +20,8 @@ than 0 -- a debutant is not someone who was paid nothing.
 
 from __future__ import annotations
 
+import re
+
 import numpy as np
 import pandas as pd
 
@@ -81,6 +83,90 @@ def build_salary_history(auction_rows, id_column="playerId",
     out = a[[id_column, year_column, price_column]].copy()
     out.columns = ["player_id", "year", "price"]
     return out.sort_values(["player_id", "year"]).reset_index(drop=True)
+
+
+def build_salary_history_from_earnings(earnings_frames, id_column="playerId",
+                                       season_column="Season",
+                                       amount_column="Amount",
+                                       price_parser=None):
+    """
+    Salary history from the earnings tables, which include RETENTIONS.
+
+    `build_salary_history` can only see what the auction trail sees,
+    and the replay engine removes retained/traded/drafted players from
+    the pool before emitting rows -- correctly, they never went under
+    the hammer. The consequence is that a player retained for three
+    seasons and then re-auctioned arrives at that auction with no
+    prior price at all, which is why established internationals show
+    up with last_salary_is_missing = 1: Rishabh Pant enters the 2025
+    auction as a debutant despite two seasons at 16 crore.
+
+    The earnings files carry exactly the missing rows -- one
+    (player, season, amount) per season played, retention included --
+    and nothing in the repo read them. Across the nine shipped files
+    they hold 2,943 distinct (player, season) salaries spanning
+    2008-2026, against the 963 the auction trail alone recovers, and
+    the files agree with each other on every overlapping pair.
+
+    earnings_frames : iterable of DataFrames, or one DataFrame.
+        Read from data_sources.earnings_template().
+
+    Returns the same (player_id, year, price) contract as
+    build_salary_history, so it drops into add_last_salary_feature
+    unchanged. `year` is the SEASON the money was earned.
+
+    On leakage: a season-S salary is fixed at the auction that
+    precedes season S, so it is known before any later auction. The
+    strictly-before rule in add_last_salary_feature therefore remains
+    exactly right -- a row at the auction for season T may see S < T
+    and must not see S == T, which is its own label.
+    """
+    if isinstance(earnings_frames, pd.DataFrame):
+        earnings_frames = [earnings_frames]
+
+    parse = price_parser or _parse_money
+
+    parts = []
+    for frame in earnings_frames:
+        missing = {id_column, season_column, amount_column} - set(frame.columns)
+        if missing:
+            raise ValueError(
+                f"earnings frame is missing {sorted(missing)}; expected the "
+                f"columns written by the earnings scrape"
+            )
+        part = frame[[id_column, season_column, amount_column]].copy()
+        part.columns = ["player_id", "year", "price"]
+        part["price"] = part["price"].apply(parse)
+        part["year"] = pd.to_numeric(part["year"], errors="coerce")
+        parts.append(part)
+
+    out = pd.concat(parts, ignore_index=True)
+    out = out.dropna(subset=["player_id", "year", "price"])
+    out["year"] = out["year"].astype(int)
+
+    # One row per (player, season). The files overlap heavily -- each
+    # is a snapshot of a player's whole history as of that edition --
+    # and they agree, so any of the duplicates will do.
+    out = out.drop_duplicates(["player_id", "year"])
+
+    return out.sort_values(["player_id", "year"]).reset_index(drop=True)
+
+
+def _parse_money(value):
+    """'27.00 Cr' / '30.00 L' / '--' -> lakh, or None."""
+    if value is None or isinstance(value, float) and pd.isna(value):
+        return None
+    text = str(value).strip()
+    if text in ("", "--", "nan", "None"):
+        return None
+    match = re.match(r"([\d.]+)\s*(cr|l)\b", text, flags=re.IGNORECASE)
+    if match:
+        amount = float(match.group(1))
+        return amount * 100.0 if match.group(2).lower() == "cr" else amount
+    try:
+        return float(text.replace(",", ""))
+    except ValueError:
+        return None
 
 
 def last_salary(salary_history, player_id, before_year):

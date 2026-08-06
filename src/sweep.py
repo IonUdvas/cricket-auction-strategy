@@ -59,6 +59,7 @@ import time
 import numpy as np
 import pandas as pd
 
+import input_creation_2.auction_replay_engine as replay_engine
 import src.training as training_module
 from src.training import prepare_holdout_data, train_from_prepared
 from src.experiments import _deep_update, summarize_predictions
@@ -119,6 +120,18 @@ def _build_key(pipeline_kwargs, cfg):
         parts["archetypes"] = "default"
     else:
         parts["archetypes"] = (tuple(arch_df.columns), len(arch_df))
+
+    # The winner censoring interval is [P, k*P), and k is a module
+    # global on the replay engine rather than a config key -- so it
+    # reaches stage 1 without passing through `cfg` and would be
+    # invisible to this key unless read directly. It changes the
+    # LABELS, not just the features, so serving a build made under a
+    # different k is not a stale feature block, it is the wrong
+    # target. Read it live for the same reason _winner_upper_bound
+    # does: a sweep sets it between calls.
+    parts["winner_upper_multiple"] = float(
+        getattr(replay_engine, "WINNER_UPPER_MULTIPLE", 2.0)
+    )
 
     return json.dumps(parts, sort_keys=True, default=str)
 

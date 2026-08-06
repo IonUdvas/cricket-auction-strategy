@@ -144,6 +144,28 @@ training:
   # samples without zeroing any individual sample's gradient.
   max_grad_norm: 5.0
 
+  # How the VALIDATION loss is weighted. "balanced" (the shipped
+  # behaviour, kept as the default so no recorded result silently
+  # changes) applies the same class-balanced sample weights the
+  # training set uses. "uniform" gives every validation row weight 1.
+  #
+  # This is not a tuning knob, it is a definition. The balanced
+  # weights come from price brackets cut on each split's own interval
+  # midpoints, and a winner's interval is [P, kP) -- so on the
+  # validation set the weights are a function of the labels, refitted
+  # per split. Two consequences:
+  #
+  #   * The reported validation NLL is not comparable between the
+  #     2025 and 2026 editions, because 182 sales and 77 sales
+  #     produce different strata and therefore different weights.
+  #   * Early stopping minimises that reweighted quantity rather than
+  #     the held-out likelihood, which is a decent share of why
+  #     validation NLL has ranked configs differently from every
+  #     point-estimate metric.
+  #
+  # Set to uniform for anything you intend to report as a likelihood.
+  valid_loss_weighting: balanced
+
 model:
 
   # player_dim, team_state_dim, auction_state_dim, num_role_features
