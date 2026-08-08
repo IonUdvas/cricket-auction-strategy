@@ -372,6 +372,7 @@ class AuctionReplayEngine:
         self.player_df, self.order_decision = resolve_auction_order(
             self.player_df,
             self.auction_max_purse,
+            bid_df=self.bid_df,
         )
 
         # ---------------------------------------------------------
