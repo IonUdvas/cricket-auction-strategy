@@ -107,7 +107,7 @@ training:
 
   # The ceiling, not the plan: early stopping is what ends the run.
   # Best epoch lands between 2 and 31 depending on seed.
-  epochs: 150
+  epochs: 60
 
   # VERIFIED FIX -- not the value, the plumbing. 256 was only ever
   # used by the holdout pipeline; load_and_encode_data hardcoded 64,
@@ -136,9 +136,9 @@ training:
   # because restore_best_weights happens to default to True inside
   # train() -- it spent 123 epochs driving validation loss from 2.68
   # to 6.25 for nothing.
-  early_stopping_patience: 12
+  early_stopping_patience: null
   early_stopping_min_delta: 0.001
-  restore_best_weights: true
+  restore_best_weights: false
 
   # Was hardcoded in train(). Bounds the update for pathological
   # samples without zeroing any individual sample's gradient.
