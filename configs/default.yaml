@@ -107,7 +107,7 @@ training:
 
   # The ceiling, not the plan: early stopping is what ends the run.
   # Best epoch lands between 2 and 31 depending on seed.
-  epochs: 60
+  epochs: 150
 
   # VERIFIED FIX -- not the value, the plumbing. 256 was only ever
   # used by the holdout pipeline; load_and_encode_data hardcoded 64,
@@ -119,7 +119,7 @@ training:
   # so a batch of 256 carries roughly 30 informative rows.
   batch_size: 256
 
-  learning_rate: 0.0003   # 1e-4 and 1e-3 both swept; no clear winner
+  learning_rate: 0.0001   # 1e-4 and 1e-3 both swept; no clear winner
 
   # Value unchanged. What changed is WHERE it applies: build_optimizer
   # now puts biases, 1-D parameters and both embedding tables in a
@@ -136,9 +136,9 @@ training:
   # because restore_best_weights happens to default to True inside
   # train() -- it spent 123 epochs driving validation loss from 2.68
   # to 6.25 for nothing.
-  early_stopping_patience: null
-  early_stopping_min_delta: 0.001
-  restore_best_weights: false
+  early_stopping_patience: 30
+  early_stopping_min_delta: 0.0
+  restore_best_weights: true
 
   # Was hardcoded in train(). Bounds the update for pathological
   # samples without zeroing any individual sample's gradient.
