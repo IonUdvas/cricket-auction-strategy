@@ -947,7 +947,25 @@ def _context_to_binary(series):
     return values, unmapped
 
 
-def add_player_context_features(training_df, columns=None, verbose=True):
+####################################################################
+# Columns for which "one distinct value across the entire edition"
+# means the scrape did not populate it, rather than meaning the
+# auction really was uniform.
+#
+# basePrice is deliberately NOT here: a single distinct base price
+# across a roster is implausible but representable, and basePrice is
+# the strongest feature in the set (Spearman 0.733 against the
+# realised price on winners), so demoting it on a heuristic would
+# cost more than it protects.
+####################################################################
+DEGENERATE_CHECK_COLUMNS = frozenset({
+    "cappedStatus",
+    "isPlayerOverseas",
+})
+
+
+def add_player_context_features(training_df, columns=None, verbose=True,
+                                degenerate_context_to_missing=True):
     """
     Promote pre-auction player context into the player feature block.
 
@@ -1010,6 +1028,54 @@ def add_player_context_features(training_df, columns=None, verbose=True):
         else:
             values, unmapped = _context_to_binary(series)
 
+        ############################################################
+        # A column that is CONSTANT across a whole edition is not a
+        # fact about that edition -- it is a column the scrape did
+        # not populate, and the two cases are indistinguishable from
+        # inside a single value.
+        #
+        # cappedStatus is the live instance and it is not benign.
+        # Measured on the shipped rosters:
+        #
+        #     2018   UNCAPPED 300 / 300
+        #     2019   UNCAPPED 269, CAPPED 1
+        #     2020   UNCAPPED 253 / 253
+        #     2021   UNCAPPED 268 / 268
+        #     2022   CAPPED 177, UNCAPPED 155
+        #     2026   CAPPED 171, UNCAPPED 158
+        #
+        # Four of the nine editions say every player in the auction
+        # was uncapped, which is false for every marquee
+        # international in them. The old behaviour promoted that
+        # straight through as ctx_cappedStatus = 0.0 and printed
+        # "CONSTANT, carries no signal" -- but it is worse than no
+        # signal. It is a confident wrong answer on 1,091 roster
+        # rows, and the model trains on it as fact.
+        #
+        # There is no clean substitute in the shipped data. The
+        # archetype table's `capped_status` is a snapshot AT THE
+        # PLAYER'S LAST AUCTION, exactly like age_at_last_auction
+        # which the config already drops as leaky -- and it is wrong
+        # in the other direction anyway (Dhoni and Gayle read
+        # "uncapped" there, correctly for 2021+ under the five-year
+        # rule and incorrectly for 2018).
+        #
+        # So the honest encoding is MISSING. The *_is_missing flag
+        # below already exists and the dataset already fills a
+        # missing value to a learnable state, so "unknown for this
+        # edition" is representable at zero schema cost. Degrading
+        # to unknown is strictly better than asserting a falsehood.
+        ############################################################
+
+        degenerate = False
+        if degenerate_context_to_missing and len(values):
+            n_distinct_raw = int(values.nunique(dropna=True))
+            if n_distinct_raw <= 1 and column in DEGENERATE_CHECK_COLUMNS:
+                degenerate = True
+                values = pd.Series(
+                    np.nan, index=values.index, dtype=float
+                )
+
         training_df[target] = values
         added.append(target)
 
@@ -1044,7 +1110,14 @@ def add_player_context_features(training_df, columns=None, verbose=True):
         if unmapped:
             line += f" | UNRECOGNISED {unmapped[:5]} -> NaN"
 
-        if n_distinct <= 1:
+        if degenerate:
+            line += (
+                "  <-- CONSTANT ACROSS THE WHOLE EDITION, demoted to "
+                "missing. A single value for every player in an auction "
+                "is an unpopulated scrape column, not a fact; feeding it "
+                "through asserts that value for every player."
+            )
+        elif n_distinct <= 1:
             line += "  <-- CONSTANT, carries no signal"
 
         summary.append(line)

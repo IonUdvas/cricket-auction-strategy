@@ -25,6 +25,8 @@ import re
 import numpy as np
 import pandas as pd
 
+from input_creation_2.money import parse_money
+
 
 def age_at(date_of_birth, as_of_date):
     """Age in years at `as_of_date`.  None when the DOB is unknown."""
@@ -153,20 +155,17 @@ def build_salary_history_from_earnings(earnings_frames, id_column="playerId",
 
 
 def _parse_money(value):
-    """'27.00 Cr' / '30.00 L' / '--' -> lakh, or None."""
-    if value is None or isinstance(value, float) and pd.isna(value):
-        return None
-    text = str(value).strip()
-    if text in ("", "--", "nan", "None"):
-        return None
-    match = re.match(r"([\d.]+)\s*(cr|l)\b", text, flags=re.IGNORECASE)
-    if match:
-        amount = float(match.group(1))
-        return amount * 100.0 if match.group(2).lower() == "cr" else amount
-    try:
-        return float(text.replace(",", ""))
-    except ValueError:
-        return None
+    """
+    '27.00 Cr' / '30.00 L' / '--' -> lakh, or None.
+
+    Delegates to input_creation_2.money.parse_money so that the
+    salary history and the replay engine cannot disagree about what a
+    price string means. The previous local regex required the unit
+    with a word boundary, which made "27.00 Crore" fall through to
+    float() and return None -- a silently dropped salary rather than
+    an error. See money.py.
+    """
+    return parse_money(value, require_unit=False)
 
 
 def last_salary(salary_history, player_id, before_year):

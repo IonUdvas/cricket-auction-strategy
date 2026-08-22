@@ -17,6 +17,7 @@ from input_creation_2.archetypes import (
 import re
 
 from input_creation_2.auction_order import resolve_auction_order
+from input_creation_2.money import parse_money
 
 
 ####################################################################
@@ -437,43 +438,25 @@ class AuctionReplayEngine:
     def _parse_price(self, value):
         """
         Convert auction prices into numeric values (Lakhs).
-        Examples
-        --------
-        "75 L"     -> 75
-        "2 Cr"     -> 200
-        "1.25 Cr"  -> 125
-        np.nan     -> np.nan
+
+        Delegates to input_creation_2.money.parse_money, which is the
+        single implementation shared with the salary history in
+        player_features/demographics.py. The two used to be separate
+        regexes that disagreed on "13.00 Crore" (this one: 13 lakh,
+        by luck; that one: None, silently) -- see money.py.
+
+        Unparseable values are collected on the engine rather than
+        dropped, and surface in quality_report().
         """
-        if pd.isna(value):
-            return np.nan
+        if not hasattr(self, "_unparseable_prices"):
+            self._unparseable_prices = []
 
-        if isinstance(value, (int, float)):
-            return float(value)
-
-        value = str(value).strip()
-
-        if value == "":
-            return np.nan
-
-        value = value.replace(",", "")
-
-        match = re.match(
-            r"([\d.]+)\s*(CR|CRORE|L|LAKH)?",
-            value.upper()
+        return parse_money(
+            value,
+            require_unit=False,
+            unparseable=self._unparseable_prices,
         )
 
-        if match is None:
-            return np.nan
-
-        amount = float(match.group(1))
-
-        unit = match.group(2)
-
-        if unit in ["CR", "CRORE"]:
-            return amount * 100
-
-        return amount
-    
     def _initialize_team_state(self):
         """
         Initialize the dynamic state maintained for each team during
@@ -1500,6 +1483,9 @@ class AuctionReplayEngine:
         report["non_monotone_ladders"] = len(self.non_monotone_ladders)
         report["final_state_violations"] = len(
             getattr(self, "final_state_violations", [])
+        )
+        report["unparseable_prices"] = len(
+            getattr(self, "_unparseable_prices", [])
         )
 
         return report
