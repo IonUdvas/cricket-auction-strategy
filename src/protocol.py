@@ -286,3 +286,105 @@ def sweep_epoch_budget(run, report_years, budgets, seeds=(0,),
                       flush=True)
 
     return pd.DataFrame(rows)
+
+
+########################################################################
+# Caching: build each (train_years, val_years) frame once, not once per
+# call.
+#
+# The notebook's `_run` wrapper calls run_training_pipeline_with_holdout,
+# which is exactly `prepared = prepare_holdout_data(...); return
+# train_from_prepared(prepared, seed=...)` -- and prepare_holdout_data is
+# the expensive half: a PlayerFeatureContext over ~2.4M deliveries,
+# identity resolution across every roster in train_years+val_years, and
+# one auction replay per year (the "Building 2018... Building 2019..."
+# minutes in every log in this project). None of that depends on the
+# seed or on model.*/training.* config -- see prepare_holdout_data's own
+# docstring, which says so and was never wired to a cache until src/
+# sweep.py added one.
+#
+# Every caller in THIS file re-triggers that full build on every single
+# seed and every single epoch budget, because `run` is called fresh each
+# time. Concretely, for one call to sweep_epoch_budget with 5 budgets and
+# REPORT_YEARS=(2025, 2026):
+#
+#     without caching:  5 budgets x 2 years x 1 seed = 10 full builds
+#     with caching:                        2 years            = 2 builds
+#
+# and the 2 come from there being two distinct (train_years, val_years)
+# pairs -- one per report year -- not two per budget. A second seed
+# multiplies the first number by 2 and leaves the second unchanged.
+#
+# make_cached_run wraps src.sweep.SweepRunner, which already implements
+# exactly this cache (keyed on years plus the four data.* keys that can
+# change the frame's shape -- see DATA_KEYS_AFFECTING_BUILD in
+# src/sweep.py). This function only adds the (train_years, val_years)
+# -> SweepRunner layer on top, and gives back something with the SAME
+# call signature the notebook's hand-written `_run` already has, so it
+# is a one-line swap:
+#
+#     from src.protocol import make_cached_run
+#     _run = make_cached_run()
+#
+# every other cell -- fold(), run_fold(), sweep_epoch_budget() -- is
+# unchanged, because they only ever call `run(train_years=, val_years=,
+# overrides=, **base_kwargs)` and never inspect what `run` is.
+########################################################################
+
+def make_cached_run(verbose=True):
+    """
+    Build each distinct (train_years, val_years) pair once per Python
+    session and reuse it for every seed / epoch budget that asks for
+    the same pair.
+
+    Returns a callable with the exact signature the notebook's `_run`
+    already has: `run(train_years=, val_years=, overrides=, **kw)` ->
+    the same dict run_training_pipeline_with_holdout returns (model,
+    history, val_predictions, ...).
+
+    The cache lives on the returned closure (`_run.runners`), not at
+    module scope -- call make_cached_run() again for a clean cache
+    (e.g. after editing the underlying CSVs) rather than restarting
+    the kernel.
+    """
+    import src.training as training_module
+    from src.experiments import _deep_update
+    from src.sweep import SweepRunner
+    from src.training import train_from_prepared
+
+    runners = {}
+
+    def _run(train_years=None, val_years=None, overrides=None, **base_kwargs):
+        key = (tuple(sorted(train_years or ())),
+               tuple(sorted(val_years or ())))
+
+        if key not in runners:
+            if verbose:
+                print(f"  [cache miss] building {key[0][0]}-{key[0][-1]} "
+                      f"-> {key[1]} (new SweepRunner)", flush=True)
+            runners[key] = SweepRunner(
+                train_years=list(train_years or ()),
+                val_years=list(val_years or ()),
+                verbose=verbose,
+                **base_kwargs,
+            )
+        elif verbose:
+            print(f"  [cache hit] {key[0][0]}-{key[0][-1]} -> {key[1]} "
+                  f"(reusing build)", flush=True)
+
+        runner = runners[key]
+
+        original = copy.deepcopy(training_module.config)
+        try:
+            merged = _deep_update(original, overrides)
+            training_module.config.clear()
+            training_module.config.update(merged)
+            prep = runner.prepared(training_module.config)
+            return train_from_prepared(prep, seed=merged.get("seed"))
+        finally:
+            training_module.config.clear()
+            training_module.config.update(original)
+
+    _run.runners = runners  # inspect len(_run.runners) for a build count
+    return _run
+
