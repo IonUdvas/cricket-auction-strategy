@@ -89,6 +89,16 @@ import random
 
 import pandas as pd
 
+
+def _progress(iterable, total=None, desc=""):
+    """tqdm when available, a plain counter when not."""
+    try:
+        from tqdm.auto import tqdm
+        return tqdm(iterable, total=total, desc=desc, unit="page")
+    except Exception:
+        return iterable
+
+
 CACHE_DIR = "/kaggle/working/cricbuzz_profiles"
 
 DELAY_SECONDS = 1.5
@@ -217,60 +227,93 @@ def parse_debuts(html):
     """
     Extract debut and last-match dates from a Cricbuzz profile.
 
-    Two independent strategies, merged: a DOM walk over label/value
-    pairs, then a regex sweep over the flattened text for anything the
-    walk missed. Returns {field: iso_date or None} plus 'profile_name'.
+    Strategy, in order of cost:
+
+      1. Flatten the page to its sequence of visible text nodes and
+         look for `label` immediately followed by `value-containing-a-
+         date`. This is what a label/value pair looks like regardless
+         of the surrounding markup, and it is ONE pass.
+      2. For anything still missing, a regex sweep over the raw text.
+
+    The first version called get_text() on every div/span/li/td/th on
+    the page -- including the giant container divs, whose text is the
+    whole page, re-flattened once per node. That measured 670 ms per
+    page on a 440 KB profile, i.e. ~9 minutes to re-parse 808 cached
+    files. The flattened-node scan is the same information for a small
+    fraction of the work.
     """
     out = {f: None for f in PROFILE_FIELDS}
     out["profile_name"] = None
     if not html:
         return out
 
-    try:
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(html, "html.parser")
-    except Exception:
-        soup = None
-
-    if soup is not None:
-        h1 = soup.find(["h1"])
-        if h1:
-            out["profile_name"] = h1.get_text(" ", strip=True) or None
-
-        for node in soup.find_all(["div", "td", "th", "span", "li"]):
-            label = node.get_text(" ", strip=True)
-            if not label or len(label) > 60:
-                continue
-            field = _field_for_label(label)
-            if not field or out[field]:
-                continue
-            candidates = []
-            sib = node.find_next_sibling()
-            if sib is not None:
-                candidates.append(sib.get_text(" ", strip=True))
-            parent = node.parent
-            if parent is not None:
-                ptext = parent.get_text(" ", strip=True)
-                candidates.append(
-                    ptext[len(label):] if ptext.startswith(label) else ptext)
-            for c in candidates:
-                d = parse_date(c)
-                if d:
-                    out[field] = d
-                    break
-
+    ############################################################
+    # PASS 1: regex over the flattened raw text. One tag-strip and a
+    # handful of searches -- roughly 20x cheaper than walking the DOM,
+    # and on this layout it resolves nearly everything. The DOM pass
+    # below only runs for whatever it misses.
+    ############################################################
     text = re.sub(r"<[^>]+>", " ", html)
     text = re.sub(r"\s+", " ", text)
+
     for spellings, field in _LABEL_MAP:
-        if out[field]:
-            continue
-        for s in spellings:
-            m = re.search(re.escape(s) + r"(.{0,120})", text, flags=re.I)
+        for s_ in spellings:
+            m = re.search(re.escape(s_) + r"(.{0,120})", text, flags=re.I)
             if m:
                 d = parse_date(m.group(1))
                 if d:
                     out[field] = d
                     break
+
+    m = re.search(r"<h1[^>]*>(.{0,120}?)</h1>", html, flags=re.I | re.S)
+    if m:
+        nm = re.sub(r"<[^>]+>", " ", m.group(1))
+        out["profile_name"] = re.sub(r"\s+", " ", nm).strip() or None
+
+    if all(out[f] for f in PROFILE_FIELDS):
+        return out
+
+    ############################################################
+    # PASS 2: DOM. Flatten to visible text nodes and look for a label
+    # immediately followed by a value containing a date -- what a
+    # label/value pair looks like whatever the markup around it is.
+    #
+    # NOT find_all + get_text per node: that calls get_text on the
+    # giant container divs too, re-flattening the whole page once per
+    # node. Measured at 670 ms/page, ~9 minutes over 808 cached files.
+    ############################################################
+    soup = None
+    try:
+        from bs4 import BeautifulSoup
+        try:
+            soup = BeautifulSoup(html, "lxml")
+        except Exception:
+            soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        soup = None
+
+    if soup is not None:
+        if not out["profile_name"]:
+            h1 = soup.find(["h1"])
+            if h1:
+                out["profile_name"] = h1.get_text(" ", strip=True) or None
+
+        nodes = [t.strip() for t in soup.stripped_strings]
+        for i in range(len(nodes) - 1):
+            label = nodes[i]
+            if not label or len(label) > 60:
+                continue
+            field = _field_for_label(label)
+            if not field or out[field]:
+                continue
+            for j in (i + 1, i + 2, i + 3):
+                if j >= len(nodes):
+                    break
+                d = parse_date(nodes[j])
+                if d:
+                    out[field] = d
+                    break
+
     return out
 
 
@@ -327,7 +370,8 @@ def scrape(player_ids, cache_dir=CACHE_DIR, limit=None, inspect=False,
         ids = ids[:limit]
 
     rows, n_cached, n_failed = [], 0, 0
-    for i, pid in enumerate(ids, 1):
+    bar = _progress(list(enumerate(ids, 1)), total=len(ids), desc="fetch")
+    for i, pid in bar:
         html, cached = fetch_profile(pid, cache_dir=cache_dir, delay=delay)
         n_cached += int(cached)
         if html is None:
@@ -364,7 +408,8 @@ def reparse_cache(player_ids=None, cache_dir=CACHE_DIR):
         player_ids = [int(f[:-5]) for f in os.listdir(cache_dir)
                       if f.endswith(".html")]
     rows = []
-    for pid in player_ids:
+    for pid in _progress(list(player_ids), total=len(list(player_ids)),
+                         desc="reparse"):
         path = _cache_path(pid, cache_dir)
         if not os.path.exists(path):
             continue
@@ -744,3 +789,123 @@ def write_capped_table(debuts, out_path,
     print(out.groupby("auction_year")[["capped", "capped_is_missing"]]
           .mean().to_string())
     return out
+
+
+# ---------------------------------------------------------------------------
+# Label discovery -- stop guessing what Cricbuzz calls these fields
+# ---------------------------------------------------------------------------
+#
+# _LABEL_MAP above is a guess. It was written without access to a live
+# page and the "Last Test / Last ODI / Last T20" spellings in it turned
+# out to match nothing: 0/808 profiles yielded a last-match date, which
+# silently made the reversion sweep meaningless rather than making it
+# fail (with last_* empty, `last` falls back to the debut and every
+# player with an old debut reverts).
+#
+# So: read the labels off the cached pages instead of guessing again.
+# `discover_labels` flattens each page into its sequence of text nodes
+# and reports every short string that is IMMEDIATELY FOLLOWED by
+# something containing a date. That is what a label/value pair looks
+# like whatever the surrounding markup is.
+
+def discover_labels(cache_dir=CACHE_DIR, n_pages=40, min_count=2,
+                    max_label_chars=40):
+    """
+    Report the label -> date pairs actually present in cached profiles.
+
+    Run this when a field parses at 0%. It needs no network and reads
+    only `n_pages` cached files, so it is seconds rather than minutes.
+
+    Returns a DataFrame of (label, count, example_value), most common
+    first. Feed the real spellings back into _LABEL_MAP.
+    """
+    import collections
+
+    try:
+        from bs4 import BeautifulSoup
+    except Exception:
+        print("bs4 not available")
+        return pd.DataFrame()
+
+    files = [f for f in os.listdir(cache_dir) if f.endswith(".html")][:n_pages]
+    if not files:
+        print(f"no cached pages in {cache_dir}")
+        return pd.DataFrame()
+
+    counts = collections.Counter()
+    example = {}
+
+    for fn in files:
+        try:
+            with open(os.path.join(cache_dir, fn), "r",
+                      encoding="utf-8", errors="replace") as fh:
+                soup = BeautifulSoup(fh.read(), "html.parser")
+        except Exception:
+            continue
+
+        # Flatten to the page's visible text nodes, in document order.
+        nodes = [s.strip() for s in soup.stripped_strings]
+        for i, text in enumerate(nodes[:-1]):
+            if not text or len(text) > max_label_chars:
+                continue
+            if parse_date(text):          # the label itself is a date
+                continue
+            nxt = nodes[i + 1]
+            d = parse_date(nxt)
+            if d:
+                counts[text] += 1
+                example.setdefault(text, nxt[:70])
+
+    rows = [{"label": lab, "count": c, "example_value": example.get(lab, "")}
+            for lab, c in counts.most_common() if c >= min_count]
+    out = pd.DataFrame(rows)
+
+    print(f"=== label/date pairs found across {len(files)} cached pages ===")
+    if out.empty:
+        print("  none -- the values may not sit adjacent to their labels on "
+              "this layout. Dump one page and look manually:")
+        print(f"    print(open('{cache_dir}/<id>.html').read()[:5000])")
+        return out
+
+    print(out.head(30).to_string(index=False))
+
+    known = {s for spellings, _ in _LABEL_MAP for s in spellings}
+    def norm(s):
+        return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", s.lower())).strip()
+    unmatched = [r for r in rows if _field_for_label(r["label"]) is None]
+    if unmatched:
+        print("\nlabels _LABEL_MAP does NOT recognise (candidates to add):")
+        for r in unmatched[:20]:
+            print(f"  {r['label']!r:34s} x{r['count']:<4} e.g. {r['example_value']!r}")
+    else:
+        print("\nevery discovered label is already recognised by _LABEL_MAP.")
+    return out
+
+
+def dump_profile_text(player_id, cache_dir=CACHE_DIR, around="debut",
+                      window=1200):
+    """
+    Print the visible text of a cached profile around a keyword.
+
+    The blunt instrument for when discover_labels finds nothing: look
+    at what the page actually says.
+    """
+    path = _cache_path(player_id, cache_dir)
+    if not os.path.exists(path):
+        print(f"no cached page for {player_id}")
+        return None
+    try:
+        from bs4 import BeautifulSoup
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            text = " | ".join(BeautifulSoup(fh.read(), "html.parser")
+                              .stripped_strings)
+    except Exception:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", fh.read()))
+
+    i = text.lower().find(around.lower())
+    if i < 0:
+        print(f"{around!r} not found; first {window} chars:\n{text[:window]}")
+    else:
+        print(text[max(0, i - window // 3): i + window])
+    return text
