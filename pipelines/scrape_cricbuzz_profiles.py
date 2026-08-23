@@ -199,120 +199,145 @@ def parse_date(text):
 # and more importantly a label like "Last Test" must not fall through to
 # the "test" branch of anything else. Longest / most specific first.
 
-_LABEL_MAP = (
-    (("last test", "test last"), "last_test"),
-    (("last odi", "odi last"), "last_odi"),
-    (("last t20", "last t20i", "last t20 international", "t20 last"),
-     "last_t20i"),
-    (("last ipl", "ipl last"), "last_ipl"),
-    (("test debut", "tests debut", "debut test"), "test_debut"),
-    (("odi debut", "odis debut", "debut odi"), "odi_debut"),
-    (("t20 debut", "t20i debut", "t20is debut",
-      "t20 international debut", "debut t20"), "t20i_debut"),
-    (("ipl debut", "debut ipl"), "ipl_debut"),
-)
+# The real Cricbuzz layout, read off cached pages with discover_labels():
+#
+#     t20
+#     Debut          vs South Africa,  2023-08-30, Kingsmead
+#     Last Played    vs Bangladesh,  2026-06-21, ...
+#     odi
+#     Debut          vs South Africa,  2023-09-09, Mangaung Oval
+#     Last Played    ...
+#
+# There is NO "Last Test" / "Last ODI" label. The FORMAT is one token
+# and the KIND ("Debut" / "Last Played") is another, so a flat
+# label->field map cannot express it -- which is why the first version
+# parsed 0/808 last-match dates while looking perfectly healthy on
+# debuts (those it caught via the separate "<format> debut" spellings).
+#
+# So: scan the page's text nodes in order, tracking the most recent
+# format and kind, and attach each date to whatever pair is current.
+
+_FORMAT_TOKENS = {
+    "test": "test", "tests": "test",
+    "odi": "odi", "odis": "odi",
+    "t20": "t20i", "t20i": "t20i", "t20is": "t20i",
+    "ipl": "ipl",
+}
+
+_KIND_TOKENS = {
+    "debut": "debut",
+    "last played": "last", "last match": "last", "last": "last",
+}
+
+# Seeing one of these means we have left the career table; clear the
+# pending kind so an unrelated date (Born, a news item) cannot be
+# attached to the last format/kind still in scope.
+_RESET_TOKENS = {
+    "born", "birth place", "height", "role", "batting style",
+    "bowling style", "personal information", "career information",
+    "rankings", "icc ranking", "batting career summary",
+    "bowling career summary", "nickname", "teams",
+}
+
+_FIELD_OF = {
+    ("test", "debut"): "test_debut", ("test", "last"): "last_test",
+    ("odi", "debut"): "odi_debut", ("odi", "last"): "last_odi",
+    ("t20i", "debut"): "t20i_debut", ("t20i", "last"): "last_t20i",
+    ("ipl", "debut"): "ipl_debut", ("ipl", "last"): "last_ipl",
+}
+
+
+def _norm_token(text):
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", text.lower())).strip()
 
 
 def _field_for_label(label):
-    norm = re.sub(r"[^a-z0-9 ]", " ", (label or "").lower())
-    norm = re.sub(r"\s+", " ", norm).strip()
-    for spellings, field in _LABEL_MAP:
-        for s in spellings:
-            if norm == s or norm.startswith(s):
-                return field
+    """
+    Kept for discover_labels' 'already recognised?' report.
+
+    Returns a field only for the legacy combined spellings; the live
+    layout is handled by the state machine in parse_debuts.
+    """
+    n = _norm_token(label or "")
+    for fmt_word, fmt in _FORMAT_TOKENS.items():
+        for kind_word, kind in (("debut", "debut"), ("last", "last")):
+            if n in (f"{fmt_word} {kind_word}", f"{kind_word} {fmt_word}"):
+                return _FIELD_OF.get((fmt, kind))
     return None
+
+
+_TAG_RE = re.compile(r"<[^>]+>")
+_SCRIPT_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.I | re.S)
+
+
+def _text_nodes(html):
+    """
+    The page's visible text fragments, in order.
+
+    Regex tag-split rather than BeautifulSoup: same sequence for this
+    purpose, ~50x cheaper. Building a DOM to read a flat label/value
+    table was costing 670 ms per page (~9 minutes over 808 files).
+    """
+    cleaned = _SCRIPT_RE.sub(" ", html)
+    return [f.strip() for f in _TAG_RE.split(cleaned) if f and f.strip()]
 
 
 def parse_debuts(html):
     """
-    Extract debut and last-match dates from a Cricbuzz profile.
+    Extract debut and last-match dates per format from a profile.
 
-    Strategy, in order of cost:
+    Walks the text nodes tracking (format, kind) state:
+      * a bare format token ("t20", "odi", ...) sets the format and
+        clears the kind
+      * "Debut" / "Last Played" sets the kind
+      * a node containing a date is attached to (format, kind)
 
-      1. Flatten the page to its sequence of visible text nodes and
-         look for `label` immediately followed by `value-containing-a-
-         date`. This is what a label/value pair looks like regardless
-         of the surrounding markup, and it is ONE pass.
-      2. For anything still missing, a regex sweep over the raw text.
-
-    The first version called get_text() on every div/span/li/td/th on
-    the page -- including the giant container divs, whose text is the
-    whole page, re-flattened once per node. That measured 670 ms per
-    page on a 440 KB profile, i.e. ~9 minutes to re-parse 808 cached
-    files. The flattened-node scan is the same information for a small
-    fraction of the work.
+    When a date arrives with a format but no kind, it is taken as the
+    DEBUT -- that is the order the page uses, and it makes the parse
+    robust to a layout that omits the explicit "Debut" label.
     """
     out = {f: None for f in PROFILE_FIELDS}
     out["profile_name"] = None
     if not html:
         return out
 
-    ############################################################
-    # PASS 1: regex over the flattened raw text. One tag-strip and a
-    # handful of searches -- roughly 20x cheaper than walking the DOM,
-    # and on this layout it resolves nearly everything. The DOM pass
-    # below only runs for whatever it misses.
-    ############################################################
-    text = re.sub(r"<[^>]+>", " ", html)
-    text = re.sub(r"\s+", " ", text)
-
-    for spellings, field in _LABEL_MAP:
-        for s_ in spellings:
-            m = re.search(re.escape(s_) + r"(.{0,120})", text, flags=re.I)
-            if m:
-                d = parse_date(m.group(1))
-                if d:
-                    out[field] = d
-                    break
-
     m = re.search(r"<h1[^>]*>(.{0,120}?)</h1>", html, flags=re.I | re.S)
     if m:
-        nm = re.sub(r"<[^>]+>", " ", m.group(1))
+        nm = _TAG_RE.sub(" ", m.group(1))
         out["profile_name"] = re.sub(r"\s+", " ", nm).strip() or None
 
-    if all(out[f] for f in PROFILE_FIELDS):
-        return out
-
-    ############################################################
-    # PASS 2: DOM. Flatten to visible text nodes and look for a label
-    # immediately followed by a value containing a date -- what a
-    # label/value pair looks like whatever the markup around it is.
-    #
-    # NOT find_all + get_text per node: that calls get_text on the
-    # giant container divs too, re-flattening the whole page once per
-    # node. Measured at 670 ms/page, ~9 minutes over 808 cached files.
-    ############################################################
-    soup = None
-    try:
-        from bs4 import BeautifulSoup
-        try:
-            soup = BeautifulSoup(html, "lxml")
-        except Exception:
-            soup = BeautifulSoup(html, "html.parser")
-    except Exception:
-        soup = None
-
-    if soup is not None:
-        if not out["profile_name"]:
-            h1 = soup.find(["h1"])
-            if h1:
-                out["profile_name"] = h1.get_text(" ", strip=True) or None
-
-        nodes = [t.strip() for t in soup.stripped_strings]
-        for i in range(len(nodes) - 1):
-            label = nodes[i]
-            if not label or len(label) > 60:
+    fmt = None
+    kind = None
+    for node in _text_nodes(html):
+        if len(node) <= 40:
+            n = _norm_token(node)
+            if n in _RESET_TOKENS:
+                kind = None
+                fmt = None
                 continue
-            field = _field_for_label(label)
-            if not field or out[field]:
+            if n in _FORMAT_TOKENS:
+                fmt = _FORMAT_TOKENS[n]
+                kind = None
                 continue
-            for j in (i + 1, i + 2, i + 3):
-                if j >= len(nodes):
-                    break
-                d = parse_date(nodes[j])
-                if d:
-                    out[field] = d
-                    break
+            if n in _KIND_TOKENS:
+                kind = _KIND_TOKENS[n]
+                continue
+            # legacy combined spelling, e.g. "Test Debut"
+            legacy = _field_for_label(node)
+            if legacy:
+                for (f_, k_), name in _FIELD_OF.items():
+                    if name == legacy:
+                        fmt, kind = f_, k_
+                        break
+                continue
+
+        d = parse_date(node)
+        if d and fmt is not None:
+            field = _FIELD_OF.get((fmt, kind or "debut"))
+            if field and out[field] is None:
+                out[field] = d
+            # consume the kind so the next date cannot re-use it
+            kind = None
 
     return out
 
