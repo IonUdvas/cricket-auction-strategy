@@ -275,9 +275,30 @@ def add_last_salary_feature(frame, salary_history, id_column="playerId",
 INTERNATIONAL_DEBUT_COLUMNS = ("test_debut", "odi_debut", "t20i_debut")
 INTERNATIONAL_LAST_COLUMNS = ("last_test", "last_odi", "last_t20i")
 
-# BCCI's reversion window. Validated by
-# pipelines/scrape_cricbuzz_profiles.sweep_reversion rather than assumed.
-DEFAULT_REVERSION_YEARS = 5
+# BCCI's five-year reversion window -- MEASURED AND REJECTED.
+#
+# sweep_reversion, scored against the five editions that carry a real
+# cappedStatus, once the last-match dates were actually being parsed:
+#
+#     reversion_years   mean_accuracy
+#     none              0.9826          <- best
+#     8                 0.9812
+#     7                 0.9781
+#     6                 0.9744
+#     5                 0.9717
+#     4                 0.9642
+#     3                 0.9497
+#
+# Monotone: every window hurts, and the shorter the window the worse.
+# So the rule as implemented costs more than it recovers and is OFF by
+# default. Pass reversion_years=N explicitly to turn it back on.
+#
+# Worth knowing before re-enabling it: this does not show the BCCI rule
+# is wrong, only that applying it from a first-and-last-appearance pair
+# does not reproduce the roster's own labelling. The roster is the
+# thing being matched, and it evidently does not implement reversion
+# the way a naive last-appearance cutoff does.
+DEFAULT_REVERSION_YEARS = None
 
 
 def build_debut_table(debut_df, id_column="playerId"):

@@ -120,7 +120,7 @@ INTERNATIONAL_DEBUTS = ("test_debut", "odi_debut", "t20i_debut")
 INTERNATIONAL_LASTS = ("last_test", "last_odi", "last_t20i")
 
 # BCCI's window. Swept rather than assumed -- see sweep_reversion.
-DEFAULT_REVERSION_YEARS = 5
+DEFAULT_REVERSION_YEARS = None
 
 URL_SLUG_PLACEHOLDER = "="
 

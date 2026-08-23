@@ -77,9 +77,28 @@ data:
   # overall_within_interval, which the 'left' rows dominate) are what
   # decide it. Run it across >=5 seeds -- the seed spread here is as
   # large as most config effects.
+  # cappedStatus is DELIBERATELY ABSENT. Capped status reaches the model
+  # exactly once, as the `capped` / `capped_is_missing` pair built in
+  # build_demographic_features from cricbuzz debut dates, keyed on
+  # (player, auction_date).
+  #
+  # Two reasons not to send the roster column as well:
+  #
+  #   1. It is unpopulated for 2018-2021 (every player reads UNCAPPED)
+  #      and populated for 2022-2026, so as a feature its MEANING
+  #      changes halfway through the panel -- the same class of problem
+  #      as the epoch transfer, and just as invisible.
+  #
+  #   2. Where it is populated it is sometimes a post-hoc snapshot
+  #      rather than an as-of fact: Ravi Bishnoi reads CAPPED on the
+  #      2022 roster although he debuted internationally four days
+  #      AFTER the 2022 auction. The derived column gets that right.
+  #
+  # Sending both would also put two ~98%-agreeing columns in the same
+  # nn.Linear, which splits the coefficient between them and makes any
+  # attribution or ablation unreadable.
   player_context_columns:
     - basePrice
-    - cappedStatus
     - isPlayerOverseas
 
   # DEFENSIVE, currently a no-op for you. With archetype_df_filtered
