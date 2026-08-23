@@ -128,9 +128,66 @@ DEBUT_FIELDS = ("test_debut", "odi_debut", "t20i_debut", "ipl_debut")
 INTERNATIONAL_FIELDS = ("test_debut", "odi_debut", "t20i_debut")
 
 
-def profile_url(player_id):
-    """Cricbuzz redirects /profiles/<id> to the slugged URL."""
-    return f"https://www.cricbuzz.com/profiles/{int(player_id)}"
+# Cricbuzz's profile route REQUIRES a slug segment after the id, but does
+# not validate its contents -- /profiles/10069/= serves the same page as
+# /profiles/10069/liam-livingstone, while /profiles/10069 (no segment)
+# returns 404 rather than redirecting.
+#
+# That matters because we do not know each player's real slug and do not
+# want to scrape an index to find out. Any placeholder works. "=" is used
+# because it was verified against the live site; if Cricbuzz ever tightens
+# the route, `probe_url_patterns` below finds the new shape against one id
+# instead of failing 800 times.
+URL_SLUG_PLACEHOLDER = "="
+
+
+def profile_url(player_id, slug=URL_SLUG_PLACEHOLDER):
+    """
+    Profile URL for an auction playerId.
+
+    The trailing slug segment is required (see URL_SLUG_PLACEHOLDER).
+    Omitting it 404s -- that was the first version of this function and
+    it failed on every player.
+    """
+    return f"https://www.cricbuzz.com/profiles/{int(player_id)}/{slug}"
+
+
+def probe_url_patterns(player_id, patterns=None, timeout=TIMEOUT):
+    """
+    Try several URL shapes against ONE id and report the status of each.
+
+    Run this first if a scrape starts returning 404s. It costs a handful
+    of requests and tells you which pattern is live, instead of guessing
+    and re-running the whole roster.
+
+    Returns {pattern_label: status_code_or_error}.
+    """
+    import requests
+
+    pid = int(player_id)
+    if patterns is None:
+        patterns = {
+            "no slug":            f"https://www.cricbuzz.com/profiles/{pid}",
+            "slug '='":           f"https://www.cricbuzz.com/profiles/{pid}/=",
+            "slug 'x'":           f"https://www.cricbuzz.com/profiles/{pid}/x",
+            "trailing slash":     f"https://www.cricbuzz.com/profiles/{pid}/",
+        }
+
+    headers = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
+    out = {}
+    for label, url in patterns.items():
+        try:
+            r = requests.get(url, headers=headers, timeout=timeout,
+                             allow_redirects=True)
+            out[label] = r.status_code
+            marker = "OK  " if r.status_code == 200 else "    "
+            print(f"  {marker}{label:16s} -> HTTP {r.status_code}  "
+                  f"({len(r.text):,} bytes)  {r.url}")
+        except Exception as exc:
+            out[label] = f"{type(exc).__name__}: {exc}"
+            print(f"      {label:16s} -> {type(exc).__name__}")
+        time.sleep(1.0)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -357,11 +414,12 @@ def scrape(player_ids, cache_dir=CACHE_DIR, limit=None, inspect=False,
         if html is None:
             n_failed += 1
             rows.append({"playerId": pid, "profile_name": None,
+                         "_fetched": False,
                          **{f: None for f in DEBUT_FIELDS}})
             continue
 
         parsed = parse_debuts(html)
-        rows.append({"playerId": pid, **parsed})
+        rows.append({"playerId": pid, "_fetched": True, **parsed})
 
         if inspect:
             got = {k: v for k, v in parsed.items() if v}
@@ -374,7 +432,7 @@ def scrape(player_ids, cache_dir=CACHE_DIR, limit=None, inspect=False,
     print(f"\nscraped {len(out)} profiles "
           f"({n_cached} from cache, {n_failed} failed)")
     _parse_health(out)
-    return out
+    return out.drop(columns=["_fetched"], errors="ignore")
 
 
 def reparse_cache(player_ids=None, cache_dir=CACHE_DIR):
@@ -393,28 +451,64 @@ def reparse_cache(player_ids=None, cache_dir=CACHE_DIR):
         if not os.path.exists(path):
             continue
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            rows.append({"playerId": int(pid), **parse_debuts(fh.read())})
+            rows.append({"playerId": int(pid), "_fetched": True,
+                         **parse_debuts(fh.read())})
     out = pd.DataFrame(rows)
     _parse_health(out)
-    return out
+    return out.drop(columns=["_fetched"], errors="ignore")
 
 
 def _parse_health(debuts):
-    """Did the parser actually work? Printed after every scrape."""
+    """
+    Did the parser actually work? Printed after every scrape.
+
+    Fetch failures and parse failures are reported SEPARATELY and the
+    parse rate is computed over fetched rows only. The first version
+    pooled them, so five 404s printed "the parser is not matching this
+    page layout" -- pointing at the wrong problem entirely, when the
+    real cause was a URL that 404s without a slug segment. A diagnostic
+    that names the wrong culprit is worse than none.
+    """
     if not len(debuts):
         print("  PARSE HEALTH: no rows.")
         return
-    print("  parse health:")
+
+    if "_fetched" in debuts.columns:
+        fetched = debuts[debuts["_fetched"]]
+        n_unfetched = len(debuts) - len(fetched)
+    else:
+        fetched, n_unfetched = debuts, 0
+
+    if n_unfetched:
+        print(f"  fetch: {n_unfetched}/{len(debuts)} page(s) could NOT be "
+              f"retrieved (nothing to parse for those).")
+        if n_unfetched == len(debuts):
+            print("    ^ EVERY fetch failed -- this is a FETCH problem, not "
+                  "a parser problem.")
+            print("      If they were 404s, the URL shape is wrong: run")
+            print("        probe_url_patterns(<any playerId>)")
+            print("      to find which pattern is live. If they were 403s, "
+                  "Kaggle internet may be off, or you are being rate "
+                  "limited -- raise DELAY_SECONDS.")
+            print("      Failures are NOT cached, so re-running retries them.")
+            return
+
+    print(f"  parse health (over the {len(fetched)} page(s) actually fetched):")
     for f in DEBUT_FIELDS:
-        got = debuts[f].notna().sum()
-        print(f"    {f:12s} parsed for {got:4d}/{len(debuts)} "
-              f"({got / len(debuts):.0%})")
-    none_at_all = debuts[list(DEBUT_FIELDS)].isna().all(axis=1).sum()
-    print(f"    no debut of any kind: {none_at_all}/{len(debuts)}")
-    if none_at_all == len(debuts):
-        print("    ^ EVERY row empty -- the parser is not matching this "
-              "page layout. Inspect a cached file and fix parse_debuts, "
-              "then call reparse_cache(). Do NOT re-scrape.")
+        got = fetched[f].notna().sum()
+        pct = got / len(fetched) if len(fetched) else 0
+        print(f"    {f:12s} parsed for {got:4d}/{len(fetched)} ({pct:.0%})")
+
+    none_at_all = fetched[list(DEBUT_FIELDS)].isna().all(axis=1).sum()
+    print(f"    no debut of any kind: {none_at_all}/{len(fetched)}")
+
+    # Some players genuinely have no debut of any kind -- uncapped
+    # domestic players are most of the pool -- so a nonzero count here
+    # is expected. All of them being empty is not.
+    if len(fetched) and none_at_all == len(fetched):
+        print("    ^ pages fetched but NOTHING parsed from any of them -- "
+              "now this IS the parser. Inspect a cached file and fix "
+              "parse_debuts, then call reparse_cache(). Do NOT re-scrape.")
 
 
 # ---------------------------------------------------------------------------
