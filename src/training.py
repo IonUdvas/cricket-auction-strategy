@@ -772,10 +772,63 @@ def prepare_holdout_data(
             "debutant."
         )
 
+    ################################################################
+    # Cricbuzz debut dates -> capped status, when available.
+    #
+    # Optional and silent when absent: the pipeline runs without it,
+    # just with `capped` constant and flagged missing. Resolved the
+    # same way every other data file is, so nothing needs a path.
+    ################################################################
+
+    ################################################################
+    # Cricbuzz debut dates -> capped status, when available.
+    #
+    # Resolved the same way every other data file is: by FILENAME
+    # through data_sources, so it can live in the inputs dataset
+    # (identity/cricbuzz_debuts.csv) and needs no path passed. Falls
+    # back to /kaggle/working for the session that first scrapes it,
+    # before it has been uploaded. CRICBUZZ_DEBUTS overrides both.
+    #
+    # Optional and silent when absent: the pipeline runs without it,
+    # just with `capped` constant and flagged missing.
+    ################################################################
+
+    debut_df = None
+    debut_path = os.environ.get("CRICBUZZ_DEBUTS")
+
+    if not debut_path:
+        try:
+            debut_path = ds.find_file("cricbuzz_debuts", extensions=(".csv",),
+                                      required=False)
+        except Exception:
+            debut_path = None
+
+    if not debut_path:
+        for cand in ("/kaggle/working/cricbuzz_debuts.csv",
+                     "cricbuzz_debuts.csv"):
+            if os.path.exists(cand):
+                debut_path = cand
+                break
+
+    if debut_path and os.path.exists(debut_path):
+        try:
+            debut_df = pd.read_csv(debut_path)
+            print(f"  debut table: {len(debut_df)} players from {debut_path}")
+        except Exception as exc:
+            print(f"  debut table at {debut_path} could not be read ({exc}); "
+                  f"capped will be all-missing")
+    else:
+        print(
+            "  no cricbuzz debut table found -- `capped` will be constant. "
+            "Build one with pipelines/scrape_cricbuzz_profiles.py, then put "
+            "cricbuzz_debuts.csv in the inputs dataset under identity/."
+        )
+
     demo_frame, demo_columns = build_demographic_features(
         combined_df,
         player_role_df=player_role_df,
         earnings_frames=earnings_frames,
+        debut_df=debut_df,
     )
 
     # Preserve existing attrs 

@@ -211,3 +211,162 @@ def add_last_salary_feature(frame, salary_history, id_column="playerId",
     out[out_column] = np.nan_to_num(price, nan=0.0)
     out[f"{out_column}_is_missing"] = np.isnan(price).astype(float)
     return out
+
+
+####################################################################
+# Capped status, as of each row's own auction date.
+#
+# WHY THIS EXISTS
+#
+# `cappedStatus` on the auction roster is one of the strongest
+# signals in the dataset -- capped players clear at 6-12x the
+# uncapped median in every edition where the column is populated:
+#
+#     2022  240L vs 20L     2025  320L vs 30L
+#     2024  200L vs 20L     2026  200L vs 30L
+#
+# and it is UNPOPULATED for 2018, 2019, 2020 and 2021: every player
+# in those four rosters reads UNCAPPED (2019 has exactly one CAPPED,
+# itself an artifact). That is 690 in-pool players, roughly half of
+# them genuinely capped internationals, all given one value.
+# add_player_context_features now demotes those editions to missing
+# rather than asserting the falsehood, but that only stops the lie --
+# it does not recover the signal.
+#
+# This recovers it, from Cricbuzz profile debut dates scraped by
+# pipelines/scrape_cricbuzz_profiles.py. Validated against the five
+# editions that DO carry a real cappedStatus: 98.3% agreement,
+# against a 44.7% "call everyone uncapped" baseline.
+#
+# ON LEAKAGE: a debut is a dated event, so
+#     capped(t) = any(debut_date < t)
+# is the same strictly-before rule last_salary uses. Nothing here can
+# see past the auction it is describing.
+#
+# KNOWN RESIDUAL (~1.7%, measured, not estimated). Two causes, both
+# understood, neither fixable from debut dates alone:
+#
+#   1. The five-year reversion rule. BCCI treats a player who has not
+#      appeared internationally in the preceding five years as
+#      uncapped again. Debut dates give the FIRST cap, never the last,
+#      so this rule cannot be evaluated here. Piyush Chawla (last cap
+#      2012), Karn Sharma (2014) and Mayank Markande (2019) all read
+#      CAPPED here and UNCAPPED on the 2025 roster, correctly by that
+#      rule. This is most of the residual and it is one-directional:
+#      the derived column over-reports capped for long-retired
+#      internationals.
+#
+#   2. The roster column is itself sometimes a POST-HOC snapshot
+#      rather than an as-of fact. Ravi Bishnoi is recorded CAPPED on
+#      the 2022 roster, but his international debut was 2022-02-16 --
+#      four days AFTER the 2022-02-12 auction. In that case the
+#      derived value is the correct one and the "disagreement" is the
+#      roster being wrong. So the 98.3% is a floor on agreement with
+#      truth, not a ceiling on correctness.
+#
+# Because of (2), this is emitted for ALL NINE editions rather than
+# only the four broken ones: one consistently-defined column across
+# the panel beats a patch that behaves differently before and after
+# 2022. The roster's own cappedStatus still reaches the model
+# separately via ctx_cappedStatus, so nothing is lost by having both.
+####################################################################
+
+# International formats only. An IPL debut is not a cap.
+INTERNATIONAL_DEBUT_COLUMNS = ("test_debut", "odi_debut", "t20i_debut")
+INTERNATIONAL_LAST_COLUMNS = ("last_test", "last_odi", "last_t20i")
+
+# BCCI's reversion window. Validated by
+# pipelines/scrape_cricbuzz_profiles.sweep_reversion rather than assumed.
+DEFAULT_REVERSION_YEARS = 5
+
+
+def build_debut_table(debut_df, id_column="playerId"):
+    """
+    playerId -> (earliest international debut, latest international
+    appearance), both as Timestamps, as a two-column DataFrame.
+
+    `debut_df` is what scrape_cricbuzz_profiles.scrape() returns. The
+    LAST-appearance half is what makes the five-year reversion rule
+    decidable; a debut date alone can only say whether a player was
+    EVER capped, never whether he still is.
+
+    Players with no international debut on record are dropped, so they
+    fall through to the missing-flag downstream rather than being
+    asserted uncapped.
+    """
+    debuts = [c for c in INTERNATIONAL_DEBUT_COLUMNS if c in debut_df.columns]
+    if not debuts:
+        raise ValueError(
+            f"debut table has none of {list(INTERNATIONAL_DEBUT_COLUMNS)}; got "
+            f"{list(debut_df.columns)}. Expected the frame written by "
+            f"pipelines/scrape_cricbuzz_profiles.py."
+        )
+    lasts = [c for c in INTERNATIONAL_LAST_COLUMNS if c in debut_df.columns]
+
+    d = debut_df[[id_column] + debuts + lasts].copy()
+    d[id_column] = pd.to_numeric(d[id_column], errors="coerce")
+    for c in debuts + lasts:
+        d[c] = pd.to_datetime(d[c], errors="coerce")
+
+    out = pd.DataFrame({
+        "debut": d[debuts].min(axis=1, skipna=True),
+        # No last-match column parsed -> the debut stands in for it. A
+        # player with one cap twenty years ago and no last-match record
+        # should revert, and his debut is the last appearance we can
+        # actually evidence.
+        "last": (d[lasts].max(axis=1, skipna=True) if lasts
+                 else d[debuts].min(axis=1, skipna=True)),
+    })
+    out.index = d[id_column].to_numpy()
+    out["last"] = out["last"].fillna(out["debut"])
+    out = out[~out.index.duplicated(keep="first")]
+    return out.dropna(subset=["debut"])
+
+
+def add_capped_feature(frame, debut_table, id_column="playerId",
+                       date_column="auction_date", out_column="capped",
+                       reversion_years=DEFAULT_REVERSION_YEARS):
+    """
+    Capped status as of each row's own auction date, with reversion.
+
+    Emitted as 0/1 plus `<out>_is_missing`, so "no debut on record" is
+    a learnable state rather than a confident UNCAPPED -- most of the
+    pool is genuinely uncapped domestic players, and a failed scrape
+    looks identical to a real debutant unless the flag separates them.
+
+    reversion_years=None turns the rule off (capped forever once
+    capped). Any number N means "capped only if the last international
+    appearance is not more than N years before this auction".
+
+    On the post-auction branch: when a player's last international
+    post-dates the auction being scored, this data cannot say whether
+    he appeared in the N years immediately before it, only that he was
+    active at some point after. He is left CAPPED. The alternative --
+    ignoring appearances after the auction -- would revert every
+    still-active veteran whose debut predates the window, which is
+    badly wrong. See capped_as_of in the scraper for the same note.
+    """
+    out = frame.copy()
+
+    if debut_table is None or len(debut_table) == 0:
+        out[out_column] = 0.0
+        out[f"{out_column}_is_missing"] = 1.0
+        return out
+
+    debut = frame[id_column].map(debut_table["debut"])
+    last = frame[id_column].map(debut_table["last"])
+    ref = pd.to_datetime(frame[date_column], errors="coerce")
+
+    known = debut.notna()
+    capped = (debut < ref) & known
+
+    if reversion_years is not None:
+        cutoff = ref - pd.DateOffset(years=int(reversion_years))
+        # Revert only when the last appearance is BOTH before this
+        # auction and older than the window.
+        reverted = capped & last.notna() & (last < ref) & (last < cutoff)
+        capped = capped & ~reverted
+
+    out[out_column] = capped.astype(float)
+    out[f"{out_column}_is_missing"] = (~known).astype(float)
+    return out

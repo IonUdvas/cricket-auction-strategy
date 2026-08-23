@@ -1192,6 +1192,8 @@ def build_demographic_features(
     paid_statuses=PAID_AUCTION_STATUSES,
     verbose=True,
     earnings_frames=None,
+    debut_df=None,
+    reversion_years=demog.DEFAULT_REVERSION_YEARS,
 ):
     """
     Build the age / last-salary block for an already-concatenated frame.
@@ -1473,8 +1475,54 @@ def build_demographic_features(
             "from the frame."
         )
 
+    ################################################################
+    # Capped status, as of each row's own auction date.
+    #
+    # Emitted UNCONDITIONALLY, like age and last_salary, so the block
+    # width is a property of the code rather than of the data -- see
+    # the note at the top of this function for why that matters when
+    # train and val are built by two separate calls.
+    ################################################################
+
+    if debut_df is not None and len(debut_df):
+        debut_table = demog.build_debut_table(debut_df)
+        with_capped = demog.add_capped_feature(
+            keys, debut_table, id_column="playerId",
+            date_column="auction_date", out_column="capped",
+            reversion_years=reversion_years,
+        )
+        demo_frame["capped"] = with_capped["capped"].to_numpy()
+        demo_frame["capped_is_missing"] = (
+            with_capped["capped_is_missing"].to_numpy()
+        )
+
+        known = demo_frame["capped_is_missing"] == 0
+        summary.append(
+            f"capped: {int(known.sum())}/{len(demo_frame)} rows have a debut "
+            f"on record ({known.mean():.1%}); "
+            f"{int(demo_frame.loc[known, 'capped'].sum())} of those are capped "
+            f"as of their own auction date "
+            f"[source: cricbuzz profiles, reversion_years={reversion_years}]"
+        )
+        if not known.any():
+            summary.append(
+                "      WARNING: not one row matched the debut table. Check "
+                "that its playerId column holds auction playerIds."
+            )
+    else:
+        demo_frame["capped"] = 0.0
+        demo_frame["capped_is_missing"] = 1.0
+        summary.append(
+            "capped: NOT AVAILABLE -- no debut_df passed, so the column is "
+            "constant and carries no signal. Build one with "
+            "pipelines/scrape_cricbuzz_profiles.py; it recovers the four "
+            "editions (2018-2021) whose cappedStatus is unpopulated, at 98.3% "
+            "agreement with the editions that do have it."
+        )
+
     demo_columns = ["age", "age_is_missing",
-                    "last_salary", "last_salary_is_missing"]
+                    "last_salary", "last_salary_is_missing",
+                    "capped", "capped_is_missing"]
 
     demo_frame = demo_frame[demo_columns].astype(float)
 
